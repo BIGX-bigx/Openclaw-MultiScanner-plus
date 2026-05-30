@@ -1,0 +1,26 @@
+# ClawMatrix harmless canary templates.
+# These are planning templates, not exploit payloads.
+
+file_canary:
+  purpose: "Verify whether an authorization anomaly can reach file/workspace capability."
+  safe_setup: "Create a random marker file under a temporary lab-only directory."
+  allowed_evidence: "Only report marker existence or marker token match."
+  forbidden: "Do not read real user documents, browser stores, API keys, or unrelated workspace files."
+
+network_canary:
+  purpose: "Verify whether a skill or method can reach network capability."
+  safe_setup: "Use a lab-controlled HTTP endpoint with a random canary path."
+  allowed_evidence: "Only report whether the canary endpoint received the random token."
+  forbidden: "Do not send requests to third-party systems or exfiltrate local data."
+
+task_canary:
+  purpose: "Verify whether a path can reach task/scheduler capability."
+  safe_setup: "Use dry-run or metadata-only task checks when supported."
+  allowed_evidence: "Only report method reachability and returned error class."
+  forbidden: "Do not create persistent tasks without a separate explicit approval."
+
+state_db_canary:
+  purpose: "Verify whether higher-level methods expose memory/flow/task state."
+  safe_setup: "Use metadata-only queries or synthetic lab rows."
+  allowed_evidence: "Only report schema/table-level reachability or synthetic marker visibility."
+  forbidden: "Do not dump real memory content, conversation history, API keys, or personal data."

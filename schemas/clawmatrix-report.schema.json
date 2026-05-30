@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClawMatrix report",
+  "type": "object",
+  "required": [
+    "reportVersion",
+    "tool",
+    "generated_at",
+    "subject",
+    "summary",
+    "layers",
+    "capability_assessment",
+    "overall_assessment",
+    "scan_metadata"
+  ],
+  "properties": {
+    "reportVersion": { "type": "string" },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "generated_at": { "type": "string" },
+    "subject": {
+      "type": "object",
+      "required": ["openclaw_home", "dynamic_mode", "canary_mode"],
+      "properties": {
+        "openclaw_home": { "type": "string" },
+        "skill_root": { "type": ["string", "null"] },
+        "gateway_url": { "type": ["string", "null"] },
+        "browser_url": { "type": ["string", "null"] },
+        "dynamic_mode": { "type": "string" },
+        "canary_mode": { "type": "string" },
+        "include_clean_sections": { "type": "boolean" },
+        "baseline_report": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "summary": {
+      "type": "object",
+      "required": ["finding_count", "highest_severity", "findings_by_severity"],
+      "properties": {
+        "finding_count": { "type": "integer" },
+        "highest_severity": { "type": "string" },
+        "findings_by_severity": {
+          "type": "object",
+          "properties": {
+            "critical": { "type": "integer" },
+            "high": { "type": "integer" },
+            "medium": { "type": "integer" },
+            "low": { "type": "integer" },
+            "info": { "type": "integer" }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "layers": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["name", "findings"],
+        "properties": {
+          "name": { "type": "string" },
+          "coverage": { "type": "object" },
+          "skipped_reason": { "type": ["string", "null"] },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "severity", "title"],
+              "properties": {
+                "id": { "type": "string" },
+                "severity": { "type": "string" },
+                "title": { "type": "string" },
+                "evidence": {}
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "capability_assessment": {
+      "type": "object",
+      "required": ["positioning", "layer_status"],
+      "properties": {
+        "positioning": { "type": "string" },
+        "layer_status": { "type": "array" }
+      },
+      "additionalProperties": true
+    },
+    "overall_assessment": {
+      "type": "object",
+      "required": ["level", "risk_index", "average_score", "metrics", "priority_actions", "layer_summaries"],
+      "properties": {
+        "level": { "type": "string" },
+        "risk_index": { "type": "integer" },
+        "average_score": { "type": "integer" },
+        "metrics": { "type": "array" },
+        "priority_actions": { "type": "array" },
+        "layer_summaries": { "type": "array" }
+      },
+      "additionalProperties": true
+    },
+    "baseline_diff": {
+      "type": ["object", "null"],
+      "properties": {
+        "baseline_path": { "type": "string" },
+        "loaded": { "type": "boolean" },
+        "error": { "type": "string" },
+        "finding_count_delta": { "type": "integer" },
+        "new_findings": { "type": "array" },
+        "resolved_findings": { "type": "array" },
+        "persisted_finding_ids": { "type": "array" },
+        "highest_new_severity": { "type": "string" },
+        "layer_deltas": { "type": "array" }
+      },
+      "additionalProperties": true
+    },
+    "scan_metadata": {
+      "type": "object",
+      "required": ["coverage", "skipped"],
+      "properties": {
+        "coverage": { "type": "object" },
+        "skipped": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

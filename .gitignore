@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+reports/*
+!reports/.gitkeep
+*.log
+*.tmp
+engines/skill-guard/target/
