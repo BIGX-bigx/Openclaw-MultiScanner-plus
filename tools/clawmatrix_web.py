@@ -192,12 +192,12 @@ INDEX_HTML = """<!doctype html>
           </div>
           
           <div class="card" style="margin-bottom: 0;">
-            <h2>🛡️ 核心扫描架构</h2>
+            <h2>🛡️ ClawMatrix v2 四层联动架构</h2>
             <div class="layer-grid">
-              <div class="layer-card"><div class="layer-num">1</div><h3>安装态与状态面</h3><p>检查 openclaw.json、明文 SQLite 状态库及权限风险，识别 Token 泄漏。</p></div>
-              <div class="layer-card"><div class="layer-num">2</div><h3>Skill 生态与供应链</h3><p>分析 SKILL.md 声明与行为差异，识别越权访问、后门隐藏及提示词注入。</p></div>
-              <div class="layer-card"><div class="layer-num">3</div><h3>信任边界与方法授权</h3><p>针对代理环境及 WebSocket 发送探测，生成细粒度的调用越权矩阵。</p></div>
-              <div class="layer-card"><div class="layer-num">4</div><h3>Canary 影响面验证</h3><p>在文件、数据库和任务队列部署无害标记，实战验证漏洞真实触达链路。</p></div>
+              <div class="layer-card"><div class="layer-num">1</div><h3>安装态与状态基线</h3><p>梳理 OpenClaw 配置、状态目录、SQLite、日志、权限和密钥线索，建立运行环境的安全基准。</p></div>
+              <div class="layer-card"><div class="layer-num">2</div><h3>Skill / Agent 生态审计</h3><p>分析 Skill、Agent、MCP 与依赖包的声明、来源、能力和供应链风险，补充生态侧证据。</p></div>
+              <div class="layer-card"><div class="layer-num">3</div><h3>信任边界与方法授权</h3><p>围绕 Gateway、RPC、WebSocket 和 Browser Control 检查方法级访问边界，形成授权差异矩阵。</p></div>
+              <div class="layer-card"><div class="layer-num">4</div><h3>Canary 影响面验证</h3><p>基于前序证据生成无害验证点，用于确认文件、浏览器、外联和运行状态等影响链路。</p></div>
             </div>
           </div>
       </div>
