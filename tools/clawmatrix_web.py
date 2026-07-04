@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import html
+import importlib.util
 import json
 import os
 import subprocess
@@ -22,6 +23,25 @@ ROOT = Path(__file__).resolve().parents[1]
 SCAN = ROOT / "tools" / "clawmatrix_scan.py"
 REPORTS = ROOT / "reports"
 META_FILE = REPORTS / "meta.json"
+WEB_SCAN_TIMEOUT_SECONDS = int(os.environ.get("CLAWMATRIX_WEB_SCAN_TIMEOUT", "360"))
+_SCAN_RENDERER = None
+
+
+def load_scan_renderer():
+    global _SCAN_RENDERER
+    if _SCAN_RENDERER is not None:
+        return _SCAN_RENDERER
+    scan_parent = str(SCAN.parent)
+    if scan_parent not in sys.path:
+        sys.path.insert(0, scan_parent)
+    spec = importlib.util.spec_from_file_location("clawmatrix_scan_runtime", SCAN)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("无法加载扫描报告渲染模块")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _SCAN_RENDERER = module
+    return module
 
 
 INDEX_HTML = """<!doctype html>
@@ -1061,6 +1081,8 @@ class Handler(BaseHTTPRequestHandler):
             
         REPORTS.mkdir(parents=True, exist_ok=True)
         out = REPORTS / f"clawmatrix_web_{timestamp()}.html"
+        json_out = out.with_suffix(".json")
+        md_out = out.with_suffix(".md")
         
         args = [
             sys.executable, str(SCAN),
@@ -1071,7 +1093,7 @@ class Handler(BaseHTTPRequestHandler):
             "--method-probe-limit", form.get("method_probe_limit", ["16"])[0] or "16",
             "--rpc-paths", form.get("rpc_paths", [",/rpc,/api/rpc,/jsonrpc,/ws,/gateway"])[0],
             "--canary-mode", form.get("canary_mode", ["plan"])[0] or "plan",
-            "--format", "html", "--out", str(out),
+            "--format", "json", "--out", str(json_out),
         ]
         if form.get("agent_ecosystem", ["1"])[0] == "0":
             args.append("--no-agent-ecosystem")
@@ -1088,22 +1110,15 @@ class Handler(BaseHTTPRequestHandler):
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
 
-            completed = subprocess.run(args, cwd=str(ROOT), text=True, capture_output=True, timeout=180, encoding="utf-8", env=env)
+            completed = subprocess.run(args, cwd=str(ROOT), text=True, capture_output=True, timeout=WEB_SCAN_TIMEOUT_SECONDS, encoding="utf-8", env=env)
             if completed.returncode != 0: raise Exception(completed.stderr or completed.stdout)
-            
-            json_out = out.with_suffix(".json")
-            json_args = args.copy()
-            json_args[json_args.index("--format") + 1] = "json"
-            json_args[json_args.index("--out") + 1] = str(json_out)
-            subprocess.run(json_args, cwd=str(ROOT), text=True, capture_output=True, timeout=180, encoding="utf-8", env=env)
 
-            md_out = out.with_suffix(".md")
-            md_args = args.copy()
-            md_args[md_args.index("--format") + 1] = "markdown"
-            md_args[md_args.index("--out") + 1] = str(md_out)
-            subprocess.run(md_args, cwd=str(ROOT), text=True, capture_output=True, timeout=180, encoding="utf-8", env=env)
+            report = json.loads(json_out.read_text(encoding="utf-8"))
+            renderer = load_scan_renderer()
+            out.write_text(renderer.render_html(report), encoding="utf-8")
+            md_out.write_text(renderer.render_markdown(report), encoding="utf-8")
             
-            self._json({"ok": True, "message": "扫描完成", "stdout": completed.stdout})
+            self._json({"ok": True, "message": "扫描完成", "stdout": completed.stdout or "扫描完成：已生成 HTML、JSON 与 Markdown 报告。"})
         except Exception as exc:
             self._json({"ok": False, "error": str(exc)}, 500)
 
