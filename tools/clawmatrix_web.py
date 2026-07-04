@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import os
 import subprocess
@@ -80,6 +81,7 @@ INDEX_HTML = """<!doctype html>
     .hint { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
     
     .actions { display: flex; gap: 16px; margin-top: 10px; }
+    .quick-divider { height: 1px; background: var(--border); margin: 14px 0 2px; }
     button { padding: 12px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
     .btn-primary { background: var(--brand); color: white; }
     .btn-primary:hover { background: var(--brand-hover); }
@@ -153,7 +155,8 @@ INDEX_HTML = """<!doctype html>
     <div class="brand"><div class="brand-dot"></div>OpenClaw Scanner</div>
     <div class="nav-item active" onclick="switchTab('overview')">首页概览</div>
     <div class="nav-item" onclick="switchTab('config-view')">扫描配置</div>
-    <div class="nav-item" onclick="switchTab('start-view')">启动扫描</div>
+    <div class="nav-item" onclick="switchTab('layer2-view')" id="nav-layer2">第二层深度引擎</div>
+    <div class="nav-item" onclick="switchTab('start-view')" id="nav-start">启动扫描</div>
     <div class="nav-item" onclick="switchTab('report-view')" id="nav-report">报告分析</div>
   </aside>
 
@@ -182,6 +185,8 @@ INDEX_HTML = """<!doctype html>
               <div class="actions" style="flex-direction: column;">
                 <button class="btn-secondary" onclick="applyPresetAndGo('quick')">快速静态体检 (仅 Plan 模式)</button>
                 <button class="btn-secondary" onclick="applyPresetAndGo('research')">深度探测模式 (启用动态 Probe/Lab)</button>
+                <div class="quick-divider"></div>
+                <button class="btn-primary" onclick="openLayer2Entry()">第二层深度引擎单独入口</button>
               </div>
             </div>
           </div>
@@ -232,6 +237,30 @@ INDEX_HTML = """<!doctype html>
           <div class="actions" style="margin-bottom: 24px;">
               <button class="btn-secondary" style="border-color: var(--brand); color: var(--brand);" onclick="saveConfigPreset()">💾 保存为预设配置</button>
               <button class="btn-primary" onclick="useCurrentConfig()">⏭️ 使用当前配置(进入启动台)</button>
+          </div>
+      </div>
+    </section>
+
+    <section id="layer2-view" class="view-section">
+      <div class="scroll-container">
+          <div class="header">
+            <h1>第二层深度引擎</h1>
+            <p>独立调用 Agent Skill Guard v2，对 Skill / Agent / MCP / prompt package 生态进行深度审计。该入口只运行第二层深度引擎，不触发第三层动态探测或第四层 Canary。</p>
+          </div>
+
+          <div class="card">
+            <h2>Agent Skill Guard v2 独立扫描</h2>
+            <div class="form-grid">
+              <div class="form-group"><label>扫描目标目录</label><input id="layer2Target" placeholder="例如 ~/.openclaw/skills 或 WSL UNC skills 路径"><div class="hint">默认可从扫描配置页同步 Skill / Agent 包根目录；留空时会尝试使用 OpenClaw 状态目录下的 skills。</div></div>
+              <div class="form-group"><label>Agent/MCP 生态解析</label><select id="layer2AgentEcosystem"><option value="1">启用</option><option value="0">关闭</option></select></div>
+              <div class="form-group"><label>深度引擎超时 (秒)</label><input id="layer2Timeout" value="120"></div>
+            </div>
+            <div class="actions">
+              <button class="btn-secondary" onclick="syncLayer2FromConfig()">从扫描配置同步目标</button>
+              <button id="layer2-btn" class="btn-primary" onclick="runLayer2Engine()">运行第二层深度引擎</button>
+            </div>
+            <div class="terminal" id="layer2-log">Ready for layer-2 Agent Skill Guard scan...</div>
+            <div id="layer2-result" class="analysis-box" style="margin-top: 16px; display: none;"></div>
           </div>
       </div>
     </section>
@@ -356,6 +385,7 @@ INDEX_HTML = """<!doctype html>
       $(tabId).classList.add('active');
       
       if(tabId === 'start-view') updateStartScanView();
+      if(tabId === 'layer2-view') syncLayer2FromConfig(false);
       if(tabId === 'report-view') fetchHistory();
     }
 
@@ -363,6 +393,23 @@ INDEX_HTML = """<!doctype html>
       const logEl = $("log");
       logEl.textContent += `\\n[${new Date().toLocaleTimeString()}] ${text}`;
       logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function openLayer2Entry() {
+      document.getElementById('nav-layer2').click();
+    }
+
+    function syncLayer2FromConfig(showLog = true) {
+      const cfg = getFormConfig();
+      const target = cfg.skill || (cfg.home ? cfg.home.replace(/[\\\\/]$/, '') + (cfg.home.includes('\\\\') ? '\\\\skills' : '/skills') : '');
+      if(target && !$("layer2Target").value) $("layer2Target").value = target;
+      $("layer2AgentEcosystem").value = cfg.agentEcosystem || "1";
+      $("layer2Timeout").value = cfg.deepTimeout || "120";
+      if(showLog) {
+        const logEl = $("layer2-log");
+        logEl.textContent += `\\n[${new Date().toLocaleTimeString()}] 已从扫描配置同步第二层目标。`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
     }
 
     // ========== 配置管理交互 ==========
@@ -376,7 +423,7 @@ INDEX_HTML = """<!doctype html>
       cfg.id = null; // 标记为非固化预设
       setFormConfig(cfg); // 同步到表单
       currentConfigToRun = cfg;
-      document.querySelectorAll('.nav-item')[2].click(); // 跳转到 start-view
+      document.getElementById('nav-start').click(); // 跳转到 start-view
       appendLog(`已自动加载 [${kind}] 临时预设，准备就绪。`);
     }
 
@@ -392,14 +439,14 @@ INDEX_HTML = """<!doctype html>
         localStorage.setItem('clawConfigs', JSON.stringify(savedConfigs));
         
         currentConfigToRun = cfg;
-        document.querySelectorAll('.nav-item')[2].click(); // 跳转到 start-view
+        document.getElementById('nav-start').click(); // 跳转到 start-view
     }
 
     function useCurrentConfig() {
         currentConfigToRun = getFormConfig();
         currentConfigToRun.name = "【当前配置页面设定】";
         currentConfigToRun.id = null;
-        document.querySelectorAll('.nav-item')[2].click(); // 跳转到 start-view
+        document.getElementById('nav-start').click(); // 跳转到 start-view
     }
 
     function deleteConfigPreset() {
@@ -510,6 +557,34 @@ INDEX_HTML = """<!doctype html>
         appendLog("✖ 错误：" + err.message); 
       } finally { 
         btn.disabled = false; 
+      }
+    }
+
+    async function runLayer2Engine() {
+      const btn = $("layer2-btn");
+      btn.disabled = true;
+      $("layer2-result").style.display = "none";
+      $("layer2-log").textContent = ">>> 正在启动 Agent Skill Guard v2 深度引擎...";
+      try {
+        const body = new URLSearchParams({
+          target: $("layer2Target").value,
+          agent_ecosystem: $("layer2AgentEcosystem").value,
+          deep_engine_timeout: $("layer2Timeout").value
+        });
+        const res = await fetch("/api/layer2_scan", { method: "POST", body });
+        const data = await res.json();
+        if(!data.ok) throw new Error(data.error || "第二层引擎运行失败");
+        $("layer2-log").textContent += `\\n[${new Date().toLocaleTimeString()}] 扫描完成。`;
+        $("layer2-result").style.display = "block";
+        $("layer2-result").innerHTML = `
+          <b>第二层深度引擎结果：</b> ${data.verdict || 'unknown'} / score=${data.score ?? 'unknown'} / findings=${data.finding_count ?? 0}
+          <div style="margin-top: 8px;">目标：<code>${data.target}</code></div>
+          <div style="margin-top: 8px;"><a href="${data.html_url}" target="_blank">打开第二层独立报告</a> | <a href="${data.json_url}" target="_blank">查看原始 JSON</a></div>
+        `;
+      } catch(err) {
+        $("layer2-log").textContent += "\\n✖ 错误：" + err.message;
+      } finally {
+        btn.disabled = false;
       }
     }
 
@@ -687,6 +762,92 @@ def report_family_paths(filename: str) -> list[Path]:
             artifacts.append(target)
     return artifacts
 
+def find_agent_guard_binary() -> Path | None:
+    names = ["agent-skill-guard.exe", "agent-skill-guard"]
+    for name in names:
+        candidate = ROOT / "engines" / "agent-skill-guard" / "bin" / name
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+def parse_json_stdout(stdout: str) -> dict:
+    try:
+        data = json.loads(stdout)
+        return data if isinstance(data, dict) else {"raw": data}
+    except json.JSONDecodeError:
+        start = stdout.find("{")
+        end = stdout.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(stdout[start:end + 1])
+                return data if isinstance(data, dict) else {"raw": data}
+            except json.JSONDecodeError:
+                pass
+    return {"raw_stdout": stdout}
+
+def render_layer2_report(payload: dict, target: str, command: list[str], stderr: str) -> str:
+    findings = payload.get("findings")
+    finding_count = len(findings) if isinstance(findings, list) else payload.get("issue_count", 0)
+    verdict = payload.get("verdict", "unknown")
+    score = payload.get("score", "unknown")
+    blocked = payload.get("blocked", False)
+    summary = payload.get("summary_zh") or payload.get("summary") or "第二层深度引擎已完成运行。"
+    top_risks = payload.get("top_risks") if isinstance(payload.get("top_risks"), list) else []
+    risks_html = "".join(f"<li>{html.escape(str(item))}</li>" for item in top_risks) or "<li>未返回 top_risks 字段。</li>"
+    pretty_json = html.escape(json.dumps(payload, ensure_ascii=False, indent=2))
+    safe_command = [Path(command[0]).name] + command[1:]
+    command_text = html.escape(" ".join(safe_command))
+    stderr_html = f"<h2>stderr</h2><pre>{html.escape(stderr)}</pre>" if stderr.strip() else ""
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Agent Skill Guard v2 第二层独立报告</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f3f4f6; color: #111827; }}
+    .hero {{ background: linear-gradient(135deg, #7f1d1d, #ef4444); color: white; padding: 32px 40px; }}
+    .wrap {{ max-width: 1180px; margin: 24px auto; padding: 0 20px; }}
+    .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 12px; padding: 22px; margin-bottom: 18px; box-shadow: 0 3px 10px rgba(15, 23, 42, .05); }}
+    .grid {{ display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 14px; }}
+    .metric {{ border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #f9fafb; }}
+    .metric b {{ display: block; font-size: 24px; margin-top: 8px; }}
+    code, pre {{ background: #111827; color: #e5e7eb; border-radius: 8px; }}
+    code {{ padding: 2px 6px; }}
+    pre {{ padding: 16px; overflow: auto; font-size: 12px; line-height: 1.5; }}
+    .badge {{ display: inline-block; padding: 4px 8px; border-radius: 999px; background: #fee2e2; color: #991b1b; font-weight: 700; }}
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <h1>Agent Skill Guard v2 第二层独立报告</h1>
+    <p>独立运行 Skill / Agent / MCP / prompt package 深度审计，不包含第三层动态授权探测和第四层 Canary。</p>
+  </div>
+  <div class="wrap">
+    <div class="card">
+      <h2>扫描概览 <span class="badge">{html.escape(str(verdict))}</span></h2>
+      <div class="grid">
+        <div class="metric">风险分数<b>{html.escape(str(score))}</b></div>
+        <div class="metric">发现数量<b>{html.escape(str(finding_count))}</b></div>
+        <div class="metric">策略阻断<b>{'是' if blocked else '否'}</b></div>
+        <div class="metric">引擎<b>v2</b></div>
+      </div>
+      <p style="margin-top:16px;">{html.escape(str(summary))}</p>
+      <p>目标：<code>{html.escape(target)}</code></p>
+      <p>命令：<code>{command_text}</code></p>
+    </div>
+    <div class="card">
+      <h2>Top Risks</h2>
+      <ol>{risks_html}</ol>
+    </div>
+    <div class="card">
+      <h2>原始 JSON 证据</h2>
+      <pre>{pretty_json}</pre>
+    </div>
+    <div class="card">{stderr_html}</div>
+  </div>
+</body>
+</html>"""
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, status: int, content: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -825,6 +986,73 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
             else:
                 self._json({"ok": False, "error": "无效的报告文件"}, 400)
+            return
+
+        if parsed.path == "/api/layer2_scan":
+            REPORTS.mkdir(parents=True, exist_ok=True)
+            target = form.get("target", [""])[0].strip()
+            if not target:
+                self._json({"ok": False, "error": "请填写第二层扫描目标目录"}, 400)
+                return
+
+            binary = find_agent_guard_binary()
+            if binary is None:
+                self._json({"ok": False, "error": "未找到 engines/agent-skill-guard/bin/agent-skill-guard 二进制"}, 500)
+                return
+
+            try:
+                timeout = int(form.get("deep_engine_timeout", ["120"])[0] or "120")
+            except ValueError:
+                timeout = 120
+            timeout = max(5, min(timeout, 900))
+
+            target = os.path.expanduser(target)
+            args = [str(binary), "scan", target, "--format", "json", "--lang", "zh-cn"]
+            config = ROOT / "engines" / "agent-skill-guard" / ".openclaw-guard.yml"
+            if config.exists():
+                args.extend(["--config", str(config)])
+            if form.get("agent_ecosystem", ["1"])[0] != "0":
+                args.append("--agent-ecosystem")
+
+            try:
+                env = os.environ.copy()
+                env["PYTHONUTF8"] = "1"
+                env["PYTHONIOENCODING"] = "utf-8"
+                completed = subprocess.run(
+                    args,
+                    cwd=str(ROOT),
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+                output_text = completed.stdout or completed.stderr
+                payload = parse_json_stdout(output_text)
+                has_report = any(key in payload for key in ["verdict", "findings", "score", "summary_zh"])
+                if completed.returncode != 0 and not has_report:
+                    raise Exception(completed.stderr or completed.stdout or f"exit code {completed.returncode}")
+                payload["_process_exit_code"] = completed.returncode
+                base = f"layer2_agent_guard_{timestamp()}"
+                json_out = REPORTS / f"{base}.json"
+                html_out = REPORTS / f"{base}.html"
+                json_out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                html_out.write_text(render_layer2_report(payload, target, args, completed.stderr), encoding="utf-8")
+
+                findings = payload.get("findings")
+                finding_count = len(findings) if isinstance(findings, list) else payload.get("issue_count", 0)
+                self._json({
+                    "ok": True,
+                    "target": target,
+                    "verdict": payload.get("verdict", "unknown"),
+                    "score": payload.get("score"),
+                    "finding_count": finding_count,
+                    "html_url": f"/reports/{html_out.name}",
+                    "json_url": f"/reports/{json_out.name}",
+                })
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, 500)
             return
 
         if parsed.path != "/api/scan":
