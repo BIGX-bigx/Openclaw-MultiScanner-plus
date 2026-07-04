@@ -2,9 +2,9 @@
 """
 Openclaw-MultiScanner environment doctor.
 
-This helper keeps the GitHub download path friendly: users can run one command
-and see whether Python, OpenClaw state, Gateway, browser-control and the optional
-Skill Guard engine are ready.
+This helper keeps the local run path friendly: users can run one command and see
+whether Python, OpenClaw state, Gateway, browser-control and Agent Skill Guard
+are ready.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL_GUARD_DIR = ROOT / "engines" / "skill-guard"
+AGENT_GUARD_DIR = ROOT / "engines" / "agent-skill-guard"
 
 
 def expand_path(value: str) -> Path:
@@ -54,15 +54,14 @@ def main() -> int:
     args = parser.parse_args()
 
     home = expand_path(args.openclaw_home)
-    cargo = shutil.which("cargo")
-    skill_guard_binary = next(
+    agent_guard_binary = next(
         (
             candidate
             for candidate in [
-                ROOT / "bin" / "openclaw-skill-guard",
-                ROOT / "bin" / "openclaw-skill-guard.exe",
-                SKILL_GUARD_DIR / "target" / "release" / "openclaw-skill-guard",
-                SKILL_GUARD_DIR / "target" / "release" / "openclaw-skill-guard.exe",
+                AGENT_GUARD_DIR / "bin" / "agent-skill-guard",
+                AGENT_GUARD_DIR / "bin" / "agent-skill-guard.exe",
+                ROOT / "bin" / "agent-skill-guard",
+                ROOT / "bin" / "agent-skill-guard.exe",
             ]
             if candidate.exists()
         ),
@@ -76,9 +75,8 @@ def main() -> int:
         "openclaw_json_exists": (home / "openclaw.json").exists(),
         "gateway": check_url(args.gateway_url),
         "browser_control": check_url(args.browser_url),
-        "skill_guard_source": SKILL_GUARD_DIR.exists(),
-        "skill_guard_binary": str(skill_guard_binary) if skill_guard_binary else "",
-        "cargo": cargo or "",
+        "agent_guard_source": AGENT_GUARD_DIR.exists(),
+        "agent_guard_binary": str(agent_guard_binary) if agent_guard_binary else "",
     }
 
     if args.json:
@@ -92,9 +90,8 @@ def main() -> int:
     print(f"- openclaw.json：{'存在' if result['openclaw_json_exists'] else '未发现'}")
     print(f"- Gateway：{result['gateway']}")
     print(f"- browser-control：{result['browser_control']}")
-    print(f"- Skill Guard 源码：{'存在' if result['skill_guard_source'] else '未发现'}")
-    print(f"- Skill Guard 二进制：{result['skill_guard_binary'] or '未发现，可用 cargo 自动构建或降级轻量扫描'}")
-    print(f"- cargo：{result['cargo'] or '未发现，Skill Guard 深度引擎会自动降级'}")
+    print(f"- Agent Skill Guard 目录：{'存在' if result['agent_guard_source'] else '未发现'}")
+    print(f"- Agent Skill Guard 二进制：{result['agent_guard_binary'] or '未发现，第二层将降级为轻量扫描'}")
     return 0
 
 

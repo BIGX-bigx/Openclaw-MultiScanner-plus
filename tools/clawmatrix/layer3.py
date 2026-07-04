@@ -385,6 +385,31 @@ def expand_method_family_probes(family: str) -> list[dict[str, Any]]:
     return [{"method": family.replace("*", "status"), "params": {}, "intent": "metadata-only"}]
 
 
+def risk_driven_family_notes(risk_context: dict[str, Any] | None) -> dict[str, list[str]]:
+    notes: dict[str, list[str]] = {}
+    if not risk_context:
+        return notes
+
+    capabilities = set(risk_context.get("observed_capabilities", [])) | set(risk_context.get("declared_capabilities", []))
+    ai_bom = risk_context.get("ai_bom", {}) if isinstance(risk_context.get("ai_bom"), dict) else {}
+    mcp_summary = risk_context.get("mcp_tool_schema_summary", {}) if isinstance(risk_context.get("mcp_tool_schema_summary"), dict) else {}
+
+    if "file" in capabilities or ai_bom.get("env_and_config"):
+        notes.setdefault("agents.files.*", []).append("第二层发现文件/配置能力，优先验证文件方法族授权边界。")
+    if "browser" in capabilities or ai_bom.get("tool_surfaces"):
+        notes.setdefault("browser.*", []).append("第二层发现浏览器或工具面能力，优先验证 browser 方法族。")
+    if "schedule" in capabilities or "process" in capabilities or mcp_summary.get("dangerous_commands"):
+        notes.setdefault("tasks.*", []).append("第二层发现进程/任务/MCP 命令信号，优先验证任务调度方法族。")
+    if ai_bom.get("external_services") or "network" in capabilities:
+        notes.setdefault("node.*", []).append("第二层发现外部服务或网络能力，优先验证节点/连接方法族。")
+    if risk_context.get("toxic_flows_count", 0) or risk_context.get("hidden_instruction_signals", 0):
+        notes.setdefault("sessions.*", []).append("第二层发现组合风险或隐藏指令，优先验证会话上下文是否隔离。")
+        notes.setdefault("memory.*", []).append("第二层发现组合风险或隐藏指令，优先验证记忆检索边界。")
+    if risk_context.get("policy_blocked") or risk_context.get("claims_mismatches", 0):
+        notes.setdefault("config.*", []).append("第二层策略/声明证据提示需复核配置方法族授权。")
+    return notes
+
+
 def layer3_trust_boundary(
     gateway_url: str | None,
     browser_url: str | None,
@@ -394,6 +419,7 @@ def layer3_trust_boundary(
     rpc_paths: list[str] | None = None,
     *,
     version: str,
+    risk_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scenarios = [
         {"id": "loopback", "host": "127.0.0.1", "origin": "http://127.0.0.1", "expected": "local-only"},
@@ -402,6 +428,7 @@ def layer3_trust_boundary(
         {"id": "forwarded-loopback", "host": "external", "x_forwarded_for": "127.0.0.1", "expected": "must-require-trusted-proxy"},
     ]
 
+    risk_notes = risk_driven_family_notes(risk_context)
     matrix = []
     for family, meaning in METHOD_FAMILIES:
         for probe_index, probe in enumerate(expand_method_family_probes(family)):
@@ -418,6 +445,8 @@ def layer3_trust_boundary(
                         "expected_policy": "拒绝或要求显式会话令牌",
                         "status": "待验证" if dynamic_mode == "plan" else "待探测",
                         "safe_next_step": "使用授权的 WebSocket/API 测试框架比较允许/拒绝结果，不执行高影响操作。",
+                        "risk_driven": family in risk_notes,
+                        "risk_notes": risk_notes.get(family, []),
                     }
                 )
 
@@ -474,11 +503,21 @@ def layer3_trust_boundary(
                 "method_families": [method for method, _ in METHOD_FAMILIES],
                 "scenarios": [scenario["id"] for scenario in scenarios],
                 "dynamic_mode": dynamic_mode,
+                "risk_driven_families": sorted(risk_notes),
                 "probe_summary": summary,
                 "differences": differences,
             },
         }
     ]
+    if risk_notes:
+        findings.append(
+            {
+                "id": "L3-RISK-DRIVEN-MATRIX",
+                "severity": "info",
+                "title": "已根据第二层 Agent/Skill 风险增强授权矩阵优先级",
+                "evidence": risk_notes,
+            }
+        )
     if dynamic_mode == "probe" and summary["accepted"]:
         findings.append(
             {
@@ -516,12 +555,19 @@ def layer3_trust_boundary(
         "method_probe_results": method_probe_results,
         "method_probe_summary": summary,
         "difference_matrices": differences,
+        "risk_driven_matrix": {
+            "enabled": bool(risk_notes),
+            "families": sorted(risk_notes),
+            "notes": risk_notes,
+            "source": "layer2-agent-skill-guard",
+        },
         "coverage": {
             "matrix_rows_total": len(matrix),
             "matrix_rows_planned": len(planned) if dynamic_mode == "probe" else len(matrix),
             "probe_targets": targets,
             "probe_results": len(method_probe_results),
             "families": len(METHOD_FAMILIES),
+            "risk_driven_families": len(risk_notes),
             "probes_per_family": {family: len(expand_method_family_probes(family)) for family, _ in METHOD_FAMILIES},
         },
         "skipped_reason": skipped_reason,

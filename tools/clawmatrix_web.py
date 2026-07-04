@@ -162,7 +162,7 @@ INDEX_HTML = """<!doctype html>
     <section id="overview" class="view-section active">
       <div class="scroll-container">
           <div class="header">
-            <div class="status-badge">Engine v0.5.0-plus</div>
+            <div class="status-badge">Engine v2.0</div>
             <h1>控制台概览</h1>
             <p>独立四层架构扫描器，无需第三方依赖即可启动，专为 OpenClaw 信任边界安全测试设计。</p>
           </div>
@@ -206,21 +206,23 @@ INDEX_HTML = """<!doctype html>
           </div>
           
           <div class="card">
-            <h2>基础目标环境</h2>
+            <h2>扫描目标与 OpenClaw 运行端点</h2>
             <div class="form-grid">
-              <div class="form-group"><label>OpenClaw 状态目录</label><input id="home" value="~/.openclaw"></div>
-              <div class="form-group"><label>Skill 根目录 (可选)</label><input id="skill" placeholder="留空则自动探测"></div>
-              <div class="form-group"><label>Gateway 探测地址</label><input id="gateway" value="http://127.0.0.1:18789/"></div>
-              <div class="form-group"><label>Browser-control 地址</label><input id="browser" value="http://127.0.0.1:18791/"></div>
+              <div class="form-group"><label>OpenClaw 状态目录</label><input id="home" value="~/.openclaw"><div class="hint">Ubuntu/WSL 环境可填写对应 Linux 路径，例如 ~/.openclaw。</div></div>
+              <div class="form-group"><label>Skill / Agent 包根目录 (可选)</label><input id="skill" placeholder="留空则自动探测 ~/.openclaw/skills"></div>
+              <div class="form-group"><label>OpenClaw Gateway / API 地址</label><input id="gateway" value="http://127.0.0.1:18789/"></div>
+              <div class="form-group"><label>Browser Control / Sidecar 地址</label><input id="browser" value="http://127.0.0.1:18791/"></div>
             </div>
           </div>
           
           <div class="card">
-            <h2>扫描引擎深度配置</h2>
+            <h2>四层扫描与新版深度引擎配置</h2>
             <div class="form-grid">
-              <div class="form-group"><label>Skill Guard 供应链引擎</label><select id="skillGuard"><option value="auto">自动探测</option><option value="off">关闭 (轻量扫描)</option><option value="on">强制启用</option></select></div>
-              <div class="form-group"><label>L3 动态授权验证</label><select id="dynamicMode"><option value="plan">Plan 模式</option><option value="probe">Probe 模式</option></select></div>
-              <div class="form-group"><label>L4 Canary 影响面验证</label><select id="canaryMode"><option value="plan">Plan 模式</option><option value="lab">Lab 模式</option></select></div>
+              <div class="form-group"><label>L2 Agent Skill Guard v2 引擎</label><select id="agentGuard"><option value="auto">自动启用</option><option value="off">关闭 (仅轻量扫描)</option><option value="on">强制启用</option></select></div>
+              <div class="form-group"><label>L2 Agent/MCP 生态解析</label><select id="agentEcosystem"><option value="1">启用</option><option value="0">关闭</option></select></div>
+              <div class="form-group"><label>L2 深度引擎超时 (秒)</label><input id="deepTimeout" value="120"></div>
+              <div class="form-group"><label>L3 运行时授权验证</label><select id="dynamicMode"><option value="plan">Plan 模式</option><option value="probe">Probe 模式</option></select></div>
+              <div class="form-group"><label>L4 风险驱动 Canary 验证</label><select id="canaryMode"><option value="plan">Plan 模式</option><option value="lab">Lab 模式</option></select></div>
               <div class="form-group"><label>报告展示策略</label><select id="includeClean"><option value="0">智能精简</option><option value="1">完整模式</option></select></div>
               <div class="form-group"><label>RPC/WS 探测字典</label><input id="rpcPaths" value=",/rpc,/api/rpc,/jsonrpc,/mcp,/ws,/gateway"></div>
               <div class="form-group"><label>Canary 实验目录</label><input id="canaryDir" placeholder="留空使用系统 temp"></div>
@@ -314,9 +316,10 @@ INDEX_HTML = """<!doctype html>
         return {
             home: $("home").value, skill: $("skill").value,
             gateway: $("gateway").value, browser: $("browser").value,
-            skillGuard: $("skillGuard").value, dynamicMode: $("dynamicMode").value,
+            agentGuard: $("agentGuard").value, dynamicMode: $("dynamicMode").value,
             canaryMode: $("canaryMode").value, includeClean: $("includeClean").value,
-            rpcPaths: $("rpcPaths").value, canaryDir: $("canaryDir").value
+            rpcPaths: $("rpcPaths").value, canaryDir: $("canaryDir").value,
+            agentEcosystem: $("agentEcosystem").value, deepTimeout: $("deepTimeout").value
         };
     }
 
@@ -326,7 +329,9 @@ INDEX_HTML = """<!doctype html>
         $("skill").value = cfg.skill || "";
         $("gateway").value = cfg.gateway || "http://127.0.0.1:18789/";
         $("browser").value = cfg.browser || "http://127.0.0.1:18791/";
-        $("skillGuard").value = cfg.skillGuard || "auto";
+        $("agentGuard").value = cfg.agentGuard || cfg.skillGuard || "auto";
+        $("agentEcosystem").value = cfg.agentEcosystem || "1";
+        $("deepTimeout").value = cfg.deepTimeout || "120";
         $("dynamicMode").value = cfg.dynamicMode || "plan";
         $("canaryMode").value = cfg.canaryMode || "plan";
         $("includeClean").value = cfg.includeClean || "0";
@@ -432,11 +437,11 @@ INDEX_HTML = """<!doctype html>
         // 构建信息小看板
         const c = currentConfigToRun;
         $("config-preview").innerHTML = `
-            <div style="margin-bottom: 8px;"><b>🎯 目标环境：</b> <span style="color:var(--brand); font-weight:bold;">${c.home}</span> | Skill目录: ${c.skill || '自动探测'}</div>
-            <div style="margin-bottom: 8px;"><b>🌐 探测节点：</b> Gateway: <code>${c.gateway}</code> | Browser: <code>${c.browser}</code></div>
-            <div style="margin-bottom: 8px;"><b>🛠️ 引擎深度：</b> 供应链(L2): <b>${c.skillGuard}</b> | 动态授权(L3): <b>${c.dynamicMode}</b> | Canary实验(L4): <b>${c.canaryMode}</b></div>
+            <div style="margin-bottom: 8px;"><b>🎯 目标环境：</b> <span style="color:var(--brand); font-weight:bold;">${c.home}</span> | Skill/Agent目录: ${c.skill || '自动探测'}</div>
+            <div style="margin-bottom: 8px;"><b>🌐 探测节点：</b> Gateway/API: <code>${c.gateway}</code> | Browser Control: <code>${c.browser}</code></div>
+            <div style="margin-bottom: 8px;"><b>🛠️ 引擎深度：</b> Agent Guard v2(L2): <b>${c.agentGuard || c.skillGuard || 'auto'}</b> | Agent生态: <b>${c.agentEcosystem === '1' ? '启用' : '关闭'}</b> | 动态授权(L3): <b>${c.dynamicMode}</b> | Canary实验(L4): <b>${c.canaryMode}</b></div>
             <div style="color:var(--muted); font-size:12px; margin-top: 10px; border-top: 1px dashed #e5e7eb; padding-top: 8px;">
-                报告策略: ${c.includeClean === '1' ? '完整展开' : '智能精简折叠'} | RPC字典: ${c.rpcPaths}
+                报告策略: ${c.includeClean === '1' ? '完整展开' : '智能精简折叠'} | 深度超时: ${c.deepTimeout || '120'}s | RPC字典: ${c.rpcPaths}
             </div>
         `;
     }
@@ -486,9 +491,10 @@ INDEX_HTML = """<!doctype html>
         const body = new URLSearchParams({
           openclaw_home: c.home, skill_root: c.skill,
           gateway_url: c.gateway, browser_url: c.browser,
-          skill_guard_engine: c.skillGuard, dynamic_mode: c.dynamicMode,
+          agent_guard_engine: c.agentGuard || c.skillGuard || "auto", dynamic_mode: c.dynamicMode,
           method_probe_limit: "16", rpc_paths: c.rpcPaths,
           canary_mode: c.canaryMode, canary_dir: c.canaryDir,
+          agent_ecosystem: c.agentEcosystem, deep_engine_timeout: c.deepTimeout,
           include_clean_sections: c.includeClean, format: "html"
         });
         
@@ -709,7 +715,8 @@ class Handler(BaseHTTPRequestHandler):
                 sqlite3.connect(":memory:").close()
                 checks.append({"name": "SQLite3 原生支持", "status": "ok", "detail": "已启用"})
             except: checks.append({"name": "SQLite3 原生支持", "status": "error", "detail": "缺失"})
-            checks.append({"name": "Cargo (Rust 编译环境)", "status": "ok" if shutil.which("cargo") else "warn", "detail": "已安装" if shutil.which("cargo") else "未安装 (引擎降级)"})
+            agent_guard = ROOT / "engines" / "agent-skill-guard" / "bin" / ("agent-skill-guard.exe" if os.name == "nt" else "agent-skill-guard")
+            checks.append({"name": "Agent Skill Guard v2 深度引擎", "status": "ok" if agent_guard.exists() else "warn", "detail": "已接入" if agent_guard.exists() else "未找到 (第二层将降级为轻量扫描)"})
             if (Path.home() / ".openclaw").exists():
                 checks.append({"name": "OpenClaw 默认配置 (~/.openclaw)", "status": "ok", "detail": "已找到"})
             else:
@@ -830,13 +837,16 @@ class Handler(BaseHTTPRequestHandler):
         args = [
             sys.executable, str(SCAN),
             "--openclaw-home", form.get("openclaw_home", ["~/.openclaw"])[0] or "~/.openclaw",
-            "--skill-guard-engine", form.get("skill_guard_engine", ["auto"])[0] or "auto",
+            "--agent-guard-engine", form.get("agent_guard_engine", form.get("skill_guard_engine", ["auto"]))[0] or "auto",
+            "--deep-engine-timeout", form.get("deep_engine_timeout", ["120"])[0] or "120",
             "--dynamic-mode", form.get("dynamic_mode", ["plan"])[0] or "plan",
             "--method-probe-limit", form.get("method_probe_limit", ["16"])[0] or "16",
             "--rpc-paths", form.get("rpc_paths", [",/rpc,/api/rpc,/jsonrpc,/ws,/gateway"])[0],
             "--canary-mode", form.get("canary_mode", ["plan"])[0] or "plan",
             "--format", "html", "--out", str(out),
         ]
+        if form.get("agent_ecosystem", ["1"])[0] == "0":
+            args.append("--no-agent-ecosystem")
         if form.get("include_clean_sections", ["0"])[0] == "1":
             args.append("--include-clean-sections")
         

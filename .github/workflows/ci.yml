@@ -19,12 +19,12 @@ jobs:
       - name: Run Python tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
-  rust:
+  agent-guard-assets:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: engines/skill-guard
     steps:
       - uses: actions/checkout@v4
-      - name: Run Rust tests
-        run: cargo test --quiet
+      - name: Verify Agent Skill Guard assets
+        run: |
+          test -f engines/agent-skill-guard/bin/agent-skill-guard.exe
+          test -f engines/agent-skill-guard/.openclaw-guard.yml
+          test -f engines/agent-skill-guard/schemas/report.schema.json

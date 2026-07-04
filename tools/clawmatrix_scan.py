@@ -41,12 +41,13 @@ from clawmatrix.report_diff import build_baseline_diff
 from clawmatrix.skill_analysis import scan_skill_dir as run_skill_scan
 
 
-VERSION = "0.5.0-plus"
+VERSION = "2.0"
 SQLITE_HEADER = b"SQLite format 3\x00"
 MAX_TEXT_BYTES = 2_000_000
 MAX_SKILL_FILES = 800
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SKILL_GUARD_ENGINE_DIR = PROJECT_ROOT / "engines" / "skill-guard"
+AGENT_GUARD_ENGINE_DIR = PROJECT_ROOT / "engines" / "agent-skill-guard"
+AGENT_GUARD_CONFIG = AGENT_GUARD_ENGINE_DIR / ".openclaw-guard.yml"
 DEFAULT_PROBE_TIMEOUT = 2.0
 DEFAULT_RPC_PATHS = ["", "/rpc", "/api/rpc", "/jsonrpc", "/mcp", "/ws", "/gateway"]
 
@@ -136,7 +137,7 @@ SEVERITY_ZH = {
 
 LAYER_LABELS = [
     "第一层：安装态与状态面审计",
-    "第二层：Skill 生态与供应链审计",
+    "第二层：Skill / Agent 生态与供应链审计",
     "第三层：连接后信任边界与方法授权验证",
     "第四层：Canary 影响面验证",
 ]
@@ -516,6 +517,54 @@ def inspect_state_layout(openclaw_home: Path) -> dict[str, Any]:
     }
 
 
+def inspect_agent_ecosystem_baseline(openclaw_home: Path) -> dict[str, Any]:
+    names = {
+        "mcp.json",
+        "mcp_settings.json",
+        "claude_desktop_config.json",
+        "settings.json",
+        "agents.json",
+        "tools.json",
+        ".openclaw-guard.yml",
+    }
+    roots = [openclaw_home, PROJECT_ROOT]
+    references: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path in find_files(root, names=names, max_files=300):
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            text = safe_read_text(path)
+            lowered = text.lower()
+            signals = []
+            if "mcp" in lowered:
+                signals.append("mcp")
+            if "command" in lowered or "args" in lowered:
+                signals.append("command_binding")
+            if "env" in lowered or "apikey" in lowered or "api_key" in lowered:
+                signals.append("env_or_secret_binding")
+            if "http://" in lowered or "https://" in lowered:
+                signals.append("external_reference")
+            references.append(
+                {
+                    "path": str(path),
+                    "relative_path": relative(path, root),
+                    "root": str(root),
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                    "signals": signals,
+                    "secret_hints": scan_secrets(path),
+                }
+            )
+    return {
+        "summary": f"发现 {len(references)} 个 Agent/MCP/工具配置引用。",
+        "references": references[:100],
+        "coverage": {"roots": [str(root) for root in roots], "references": len(references)},
+    }
+
+
 def inspect_gateway_urls(urls: list[str]) -> list[dict[str, Any]]:
     results = []
     for url in urls:
@@ -560,6 +609,7 @@ def layer1_baseline(openclaw_home: Path) -> dict[str, Any]:
 
     sqlite_files = [inspect_sqlite(path) for path in find_files(openclaw_home, suffix=".sqlite")]
     state_layout = inspect_state_layout(openclaw_home)
+    agent_ecosystem = inspect_agent_ecosystem_baseline(openclaw_home)
     important = {"registry.sqlite", "runs.sqlite", "main.sqlite"}
     present_important = sorted({Path(item["path"]).name for item in sqlite_files if Path(item["path"]).name in important})
 
@@ -615,6 +665,20 @@ def layer1_baseline(openclaw_home: Path) -> dict[str, Any]:
                     "evidence": {"path": log["path"], "secret_hints": log["secret_hints"]},
                 }
             )
+    risky_agent_refs = [
+        ref
+        for ref in agent_ecosystem.get("references", [])
+        if ref.get("secret_hints") or "command_binding" in ref.get("signals", []) or "env_or_secret_binding" in ref.get("signals", [])
+    ]
+    if risky_agent_refs:
+        findings.append(
+            {
+                "id": "L1-AGENT-ECOSYSTEM-CONFIG-SIGNAL",
+                "severity": "low",
+                "title": "本地 Agent/MCP/工具配置基线中存在需复核的能力绑定信号",
+                "evidence": risky_agent_refs[:10],
+            }
+        )
 
     return {
         "name": "Layer 1 - install/state baseline",
@@ -623,11 +687,13 @@ def layer1_baseline(openclaw_home: Path) -> dict[str, Any]:
         "config_semantics": config_semantics,
         "sqlite_files": sqlite_files,
         "state_layout": state_layout,
+        "agent_ecosystem_baseline": agent_ecosystem,
         "coverage": {
             "config_files": len(config_files),
             "config_semantics": len(config_semantics),
             "sqlite_files": len(sqlite_files),
             "log_files": len(state_layout.get("log_files", [])),
+            "agent_ecosystem_refs": len(agent_ecosystem.get("references", [])),
         },
         "skipped_reason": None if openclaw_home.exists() else "openclaw-home-missing",
         "findings": findings,
@@ -733,104 +799,247 @@ def scan_skill_dir(skill_md: Path) -> dict[str, Any]:
     }
 
 
-def find_skill_guard_binary() -> Path | None:
+def decode_process_output(data: bytes) -> str:
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace")
+    return data.decode("utf-8", errors="replace")
+
+
+def parse_json_output(data: bytes) -> dict[str, Any] | None:
+    text = decode_process_output(data).strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return {"raw": text[:20000]}
+    return value if isinstance(value, dict) else {"raw": text[:20000]}
+
+
+def find_agent_guard_binary() -> Path | None:
+    names = ["agent-skill-guard.exe", "agent-skill-guard"]
     candidates = [
-        SKILL_GUARD_ENGINE_DIR / "target" / "release" / "openclaw-skill-guard.exe",
-        SKILL_GUARD_ENGINE_DIR / "target" / "release" / "openclaw-skill-guard",
-        SKILL_GUARD_ENGINE_DIR / "target" / "release" / "openclaw-skill-guard-cli.exe",
-        SKILL_GUARD_ENGINE_DIR / "target" / "release" / "openclaw-skill-guard-cli",
-        PROJECT_ROOT / "bin" / "openclaw-skill-guard.exe",
-        PROJECT_ROOT / "bin" / "openclaw-skill-guard",
+        AGENT_GUARD_ENGINE_DIR / "bin" / name
+        for name in names
+    ] + [
+        PROJECT_ROOT / "bin" / name
+        for name in names
     ]
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
             return candidate
-    return None
+    path_hit = shutil.which("agent-skill-guard") or shutil.which("agent-skill-guard.exe")
+    return Path(path_hit) if path_hit else None
 
 
-def run_skill_guard_engine(root: Path, mode: str) -> dict[str, Any]:
+def normalize_agent_guard_report(report: dict[str, Any] | None) -> dict[str, Any]:
+    if not report:
+        return {
+            "engine": "agent-skill-guard",
+            "score": None,
+            "verdict": None,
+            "blocked": None,
+            "summary_zh": None,
+            "top_risks": [],
+            "issue_count": 0,
+            "issue_codes": [],
+            "toxic_flows_count": 0,
+            "hidden_instruction_signals": 0,
+            "claims_mismatches": 0,
+            "mcp_findings": 0,
+            "ai_bom_packages": 0,
+            "external_services": 0,
+            "agent_packages": 0,
+            "integrity_digests": 0,
+            "policy_blocked": False,
+            "declared_capabilities": [],
+            "observed_capabilities": [],
+            "ai_bom": {},
+            "mcp_tool_schema_summary": {},
+        }
+
+    findings = report.get("findings", []) if isinstance(report.get("findings"), list) else []
+    issue_codes = sorted({str(item.get("issue_code")) for item in findings if isinstance(item, dict) and item.get("issue_code")})
+    toxic_summary = report.get("toxic_flow_summary", {}) if isinstance(report.get("toxic_flow_summary"), dict) else {}
+    hidden_summary = report.get("hidden_instruction_summary", {}) if isinstance(report.get("hidden_instruction_summary"), dict) else {}
+    claims_summary = report.get("claims_review_summary", {}) if isinstance(report.get("claims_review_summary"), dict) else {}
+    mcp_summary = report.get("mcp_tool_schema_summary", {}) if isinstance(report.get("mcp_tool_schema_summary"), dict) else {}
+    ai_bom = report.get("ai_bom", {}) if isinstance(report.get("ai_bom"), dict) else {}
+    package_index = report.get("agent_package_index", {}) if isinstance(report.get("agent_package_index"), dict) else {}
+    integrity = report.get("integrity_snapshot", {}) if isinstance(report.get("integrity_snapshot"), dict) else {}
+    policy = report.get("policy_evaluation", {}) if isinstance(report.get("policy_evaluation"), dict) else {}
+    cap_manifest = report.get("capability_manifest", {}) if isinstance(report.get("capability_manifest"), dict) else {}
+
+    declared: set[str] = set()
+    observed: set[str] = set()
+    for entry in cap_manifest.get("entries", []) if isinstance(cap_manifest.get("entries"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        for key, bucket in [("declared", declared), ("observed", observed), ("capabilities", observed), ("permissions", declared)]:
+            value = entry.get(key)
+            if isinstance(value, list):
+                bucket.update(str(item) for item in value)
+            elif isinstance(value, str):
+                bucket.add(value)
+
+    return {
+        "engine": "agent-skill-guard",
+        "score": report.get("score"),
+        "verdict": report.get("verdict"),
+        "blocked": report.get("blocked"),
+        "summary_zh": report.get("summary_zh"),
+        "top_risks": report.get("top_risks", []) if isinstance(report.get("top_risks"), list) else [],
+        "issue_count": len(findings),
+        "issue_codes": issue_codes,
+        "toxic_flows_count": int(toxic_summary.get("flows_count", 0) or len(report.get("toxic_flows", []) or [])),
+        "hidden_instruction_signals": len(hidden_summary.get("signals", []) or []),
+        "claims_mismatches": len(claims_summary.get("mismatches", []) or []),
+        "mcp_findings": int(mcp_summary.get("findings_count", 0) or 0),
+        "ai_bom_packages": len(ai_bom.get("packages", []) or []),
+        "external_services": len(ai_bom.get("external_services", []) or []),
+        "agent_packages": len(package_index.get("packages", []) or []),
+        "integrity_digests": len(integrity.get("skill_file_digests", []) or []),
+        "policy_blocked": bool(policy.get("blocked")),
+        "policy_reason_zh": policy.get("reason_zh"),
+        "declared_capabilities": sorted(declared),
+        "observed_capabilities": sorted(observed),
+        "ai_bom": ai_bom,
+        "mcp_tool_schema_summary": mcp_summary,
+    }
+
+
+def run_skill_guard_engine(root: Path, mode: str, *, agent_ecosystem: bool = True, timeout: int = 120) -> dict[str, Any]:
     result: dict[str, Any] = {
         "enabled": mode != "off",
         "available": False,
         "status": "skipped",
-        "engine_dir": str(SKILL_GUARD_ENGINE_DIR),
+        "engine_name": None,
+        "engine_dir": None,
         "target": str(root),
         "runner": None,
-        "missing_optional_assets": [
-            name
-            for name in ["README.md", "CHANGELOG.md", "docs", "fixtures"]
-            if not (SKILL_GUARD_ENGINE_DIR / name).exists()
-        ],
+        "missing_optional_assets": [],
+        "command": None,
+        "normalized": normalize_agent_guard_report(None),
         "report": None,
         "error": None,
     }
     if mode == "off":
-        result["error"] = "已关闭 Skill Guard 深度引擎"
+        result["error"] = "已关闭第二层深度引擎"
         return result
-    if not SKILL_GUARD_ENGINE_DIR.exists():
-        result["error"] = "未找到内置 Skill Guard 引擎目录"
-        return result
-    binary = find_skill_guard_binary()
-    cargo = shutil.which("cargo")
+
+    binary = find_agent_guard_binary()
     if binary:
         result["available"] = True
         result["runner"] = "binary"
-        command = [str(binary), "scan", str(root), "--format", "json"]
-    elif cargo:
-        result["available"] = True
-        result["runner"] = "cargo"
-        command = [
-            cargo,
-            "run",
-            "-q",
-            "-p",
-            "openclaw-skill-guard-cli",
-            "--",
-            "scan",
-            str(root),
-            "--format",
-            "json",
-        ]
+        result["engine_name"] = "agent-skill-guard"
+        result["engine_dir"] = str(AGENT_GUARD_ENGINE_DIR)
+        command = [str(binary), "scan", str(root), "--format", "json", "--lang", "zh-cn"]
+        if AGENT_GUARD_CONFIG.exists():
+            command.extend(["--config", str(AGENT_GUARD_CONFIG)])
+        if agent_ecosystem:
+            command.append("--agent-ecosystem")
+        cwd = AGENT_GUARD_ENGINE_DIR if AGENT_GUARD_ENGINE_DIR.exists() else PROJECT_ROOT
     else:
-        result["error"] = "未找到 cargo 或预编译 Skill Guard 二进制；深度扫描未运行"
+        result["error"] = "未找到 Agent Skill Guard 二进制；第二层深度扫描未运行，已保留轻量 Skill/Agent 扫描能力"
         result["runner"] = None
         result["missing_optional_assets"] = [
             name
-            for name in ["README.md", "CHANGELOG.md", "docs", "fixtures"]
-            if not (SKILL_GUARD_ENGINE_DIR / name).exists()
+            for name in ["agent-skill-guard.exe", ".openclaw-guard.yml", "report.schema.json"]
+            if not (
+                (AGENT_GUARD_ENGINE_DIR / "bin" / name).exists()
+                or (AGENT_GUARD_ENGINE_DIR / name).exists()
+                or (AGENT_GUARD_ENGINE_DIR / "schemas" / name).exists()
+            )
         ]
         return result
+
+    result["command"] = [Path(part).name if index == 0 else part for index, part in enumerate(command)]
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     try:
         completed = subprocess.run(
             command,
-            cwd=str(SKILL_GUARD_ENGINE_DIR),
-            text=True,
+            cwd=str(cwd),
             capture_output=True,
-            timeout=90,
+            timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
-        result["error"] = "Skill Guard 深度扫描超时"
+        result["error"] = "第二层深度扫描超时"
         return result
     except OSError as exc:
         result["status"] = "failed"
         result["error"] = str(exc)
         return result
 
+    stdout = completed.stdout or b""
+    stderr = completed.stderr or b""
     if completed.returncode not in {0, 2, 3}:
         result["status"] = "failed"
-        result["error"] = completed.stderr or completed.stdout
+        result["error"] = decode_process_output(stderr or stdout)
         return result
 
     result["status"] = "completed"
-    try:
-        result["report"] = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        result["report"] = {"raw": completed.stdout[:20000]}
+    parsed = parse_json_output(stdout)
+    result["report"] = parsed
+    result["normalized"] = normalize_agent_guard_report(parsed)
     return result
 
 
-def layer2_skill_supply_chain(skill_root: Path | None, openclaw_home: Path, skill_guard_mode: str) -> dict[str, Any]:
+def aggregate_layer2_risk_context(skill_reports: list[dict[str, Any]], guard_reports: list[dict[str, Any]]) -> dict[str, Any]:
+    declared: set[str] = set()
+    observed: set[str] = set()
+    risk_patterns: set[str] = set()
+    for skill in skill_reports:
+        declared.update(str(item) for item in skill.get("declared_capabilities", []))
+        observed.update(str(item) for item in skill.get("observed_capabilities", []))
+        risk_patterns.update(str(key) for key in skill.get("risk_patterns", {}).keys())
+
+    normalized_runs = [run.get("normalized", {}) for run in guard_reports if isinstance(run.get("normalized"), dict)]
+    toxic_flows = sum(int(item.get("toxic_flows_count", 0) or 0) for item in normalized_runs)
+    hidden_signals = sum(int(item.get("hidden_instruction_signals", 0) or 0) for item in normalized_runs)
+    claims_mismatches = sum(int(item.get("claims_mismatches", 0) or 0) for item in normalized_runs)
+    mcp_findings = sum(int(item.get("mcp_findings", 0) or 0) for item in normalized_runs)
+    ai_bom_packages = sum(int(item.get("ai_bom_packages", 0) or 0) for item in normalized_runs)
+    external_services = sum(int(item.get("external_services", 0) or 0) for item in normalized_runs)
+    agent_packages = sum(int(item.get("agent_packages", 0) or 0) for item in normalized_runs)
+    policy_blocked = any(bool(item.get("policy_blocked")) for item in normalized_runs)
+    top_risks = []
+    for item in normalized_runs:
+        top_risks.extend(str(risk) for risk in item.get("top_risks", [])[:10])
+        declared.update(str(cap) for cap in item.get("declared_capabilities", []))
+        observed.update(str(cap) for cap in item.get("observed_capabilities", []))
+
+    return {
+        "declared_capabilities": sorted(declared),
+        "observed_capabilities": sorted(observed),
+        "risk_patterns": sorted(risk_patterns),
+        "toxic_flows_count": toxic_flows,
+        "hidden_instruction_signals": hidden_signals,
+        "claims_mismatches": claims_mismatches,
+        "mcp_findings": mcp_findings,
+        "ai_bom_packages": ai_bom_packages,
+        "external_services": external_services,
+        "agent_packages": agent_packages,
+        "policy_blocked": policy_blocked,
+        "top_risks": sorted(set(top_risks)),
+        "ai_bom": next((item.get("ai_bom") for item in normalized_runs if item.get("ai_bom")), {}),
+        "mcp_tool_schema_summary": next((item.get("mcp_tool_schema_summary") for item in normalized_runs if item.get("mcp_tool_schema_summary")), {}),
+    }
+
+
+def layer2_skill_supply_chain(
+    skill_root: Path | None,
+    openclaw_home: Path,
+    skill_guard_mode: str,
+    *,
+    agent_ecosystem: bool = True,
+    deep_engine_timeout: int = 120,
+) -> dict[str, Any]:
     roots: list[Path] = []
     if skill_root:
         roots.append(skill_root)
@@ -856,7 +1065,14 @@ def layer2_skill_supply_chain(skill_root: Path | None, openclaw_home: Path, skil
     guard_reports = []
     if skill_guard_mode != "off":
         for root in roots:
-            guard_reports.append(run_skill_guard_engine(root, skill_guard_mode))
+            guard_reports.append(
+                run_skill_guard_engine(
+                    root,
+                    skill_guard_mode,
+                    agent_ecosystem=agent_ecosystem,
+                    timeout=deep_engine_timeout,
+                )
+            )
 
     findings = []
     for item in skill_reports:
@@ -900,9 +1116,9 @@ def layer2_skill_supply_chain(skill_root: Path | None, openclaw_home: Path, skil
         if guard["enabled"] and guard["status"] != "completed":
             findings.append(
                 {
-                    "id": "L2-SKILL-GUARD-ENGINE-NOT-RUN",
+                    "id": "L2-AGENT-GUARD-ENGINE-NOT-RUN",
                     "severity": "info",
-                    "title": "Skill Guard 深度扫描引擎未完成运行",
+                    "title": "Agent Skill Guard 深度扫描引擎未完成运行",
                     "evidence": {
                         "target": guard["target"],
                         "status": guard["status"],
@@ -910,21 +1126,84 @@ def layer2_skill_supply_chain(skill_root: Path | None, openclaw_home: Path, skil
                     },
                 }
             )
+        normalized = guard.get("normalized", {})
+        if guard.get("status") == "completed" and normalized:
+            if normalized.get("policy_blocked") or normalized.get("blocked"):
+                findings.append(
+                    {
+                        "id": "L2-AGENT-GUARD-POLICY-BLOCKED",
+                        "severity": "high",
+                        "title": "Agent Skill Guard 策略判定为阻断",
+                        "evidence": {
+                            "target": guard.get("target"),
+                            "verdict": normalized.get("verdict"),
+                            "score": normalized.get("score"),
+                            "reason": normalized.get("policy_reason_zh"),
+                        },
+                    }
+                )
+            if normalized.get("toxic_flows_count", 0):
+                findings.append(
+                    {
+                        "id": "L2-AGENT-TOXIC-FLOW",
+                        "severity": "high",
+                        "title": "Agent/Skill 存在不可信输入、敏感数据与外联或执行能力组合风险",
+                        "evidence": {"target": guard.get("target"), "count": normalized.get("toxic_flows_count")},
+                    }
+                )
+            if normalized.get("hidden_instruction_signals", 0):
+                findings.append(
+                    {
+                        "id": "L2-HIDDEN-INSTRUCTION-SIGNAL",
+                        "severity": "medium",
+                        "title": "Agent/Skill 存在隐藏指令、Trojan Source 或 schema 投毒信号",
+                        "evidence": {"target": guard.get("target"), "count": normalized.get("hidden_instruction_signals")},
+                    }
+                )
+            if normalized.get("mcp_findings", 0):
+                findings.append(
+                    {
+                        "id": "L2-MCP-TOOL-SCHEMA-RISK",
+                        "severity": "medium",
+                        "title": "MCP tool/schema 静态审计发现风险信号",
+                        "evidence": {"target": guard.get("target"), "count": normalized.get("mcp_findings")},
+                    }
+                )
+            if normalized.get("claims_mismatches", 0):
+                findings.append(
+                    {
+                        "id": "L2-CLAIMS-EVIDENCE-MISMATCH",
+                        "severity": "low",
+                        "title": "Agent/Skill 自称能力或来源与实际证据不完全一致",
+                        "evidence": {"target": guard.get("target"), "count": normalized.get("claims_mismatches")},
+                    }
+                )
+
+    risk_context = aggregate_layer2_risk_context(skill_reports, guard_reports)
 
     return {
-        "name": "Layer 2 - skill supply-chain audit",
+        "name": "Layer 2 - skill and agent supply-chain audit",
         "roots": [str(root) for root in roots],
         "skills": skill_reports,
         "skill_guard_engine": {
             "mode": skill_guard_mode,
-            "engine_dir": str(SKILL_GUARD_ENGINE_DIR),
+            "preferred_engine": "agent-skill-guard",
+            "agent_ecosystem": agent_ecosystem,
+            "agent_engine_dir": str(AGENT_GUARD_ENGINE_DIR),
             "runs": guard_reports,
         },
+        "risk_context": risk_context,
         "coverage": {
             "roots": len(roots),
             "skills_scanned": len(skill_reports),
             "guard_runs": len(guard_reports),
             "guard_completed": sum(1 for item in guard_reports if item.get("status") == "completed"),
+            "agent_guard_completed": sum(1 for item in guard_reports if item.get("status") == "completed" and item.get("engine_name") == "agent-skill-guard"),
+            "agent_ecosystem": agent_ecosystem,
+            "risk_context_signals": sum(
+                int(bool(risk_context.get(key)))
+                for key in ["toxic_flows_count", "hidden_instruction_signals", "mcp_findings", "claims_mismatches", "ai_bom_packages", "external_services"]
+            ),
         },
         "skipped_reason": None if roots else "no-skill-roots",
         "findings": findings,
@@ -1400,7 +1679,12 @@ def observe_lab_canaries(lab_setup: dict[str, Any] | None) -> dict[str, Any] | N
     return observation
 
 
-def layer4_canary_plan(canary_mode: str = "plan", canary_dir: Path | None = None, canary_url: str | None = None) -> dict[str, Any]:
+def layer4_canary_plan(
+    canary_mode: str = "plan",
+    canary_dir: Path | None = None,
+    canary_url: str | None = None,
+    risk_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     canaries = [
         {
             "id": "file-canary",
@@ -1427,6 +1711,51 @@ def layer4_canary_plan(canary_mode: str = "plan", canary_dir: Path | None = None
             "blocked_if": "方法向非可信调用者暴露状态数据库内容。",
         },
     ]
+    risk_context = risk_context or {}
+    risk_driven_canaries: list[dict[str, Any]] = []
+    observed = set(risk_context.get("observed_capabilities", [])) | set(risk_context.get("declared_capabilities", []))
+    if risk_context.get("mcp_findings") or risk_context.get("mcp_tool_schema_summary", {}).get("dangerous_commands"):
+        risk_driven_canaries.append(
+            {
+                "id": "mcp-schema-canary",
+                "surface": "MCP tool schema / command binding",
+                "safe_signal": "只复核 tool schema、command/env 声明和 dry-run 可达性，不启动 MCP server。",
+                "blocked_if": "MCP 工具声明危险命令、宽泛 env 传递或未绑定可信来源。",
+                "source": "layer2-agent-skill-guard",
+            }
+        )
+    if risk_context.get("hidden_instruction_signals"):
+        risk_driven_canaries.append(
+            {
+                "id": "prompt-instruction-canary",
+                "surface": "prompt / companion docs / hidden instruction",
+                "safe_signal": "仅使用 synthetic 指令标记验证是否进入报告和审计链，不向运行时注入真实指令。",
+                "blocked_if": "隐藏指令可跨越 skill 文档边界影响工具调用策略。",
+                "source": "layer2-agent-skill-guard",
+            }
+        )
+    if "browser" in observed:
+        risk_driven_canaries.append(
+            {
+                "id": "browser-canary",
+                "surface": "browser.* / browser-control",
+                "safe_signal": "只验证 browser.status / tabs metadata，不读取真实页面内容。",
+                "blocked_if": "非可信上下文可触达浏览器控制能力。",
+                "source": "layer2-agent-skill-guard",
+            }
+        )
+    if risk_context.get("toxic_flows_count") or risk_context.get("external_services") or "network" in observed:
+        risk_driven_canaries.append(
+            {
+                "id": "egress-canary",
+                "surface": "network egress / external services",
+                "safe_signal": "只使用课题组自控 URL 或 plan-only 观察点，不发送本地数据。",
+                "blocked_if": "不可信输入可与敏感数据面和外联能力组合。",
+                "source": "layer2-agent-skill-guard",
+            }
+        )
+    canaries.extend(risk_driven_canaries)
+
     lab_setup = None
     lab_observation = None
     findings = [
@@ -1437,6 +1766,15 @@ def layer4_canary_plan(canary_mode: str = "plan", canary_dir: Path | None = None
             "evidence": [item["id"] for item in canaries],
         }
     ]
+    if risk_driven_canaries:
+        findings.append(
+            {
+                "id": "L4-RISK-DRIVEN-CANARY",
+                "severity": "info",
+                "title": "已根据第二层 Agent/Skill 风险增强 Canary 影响面验证计划",
+                "evidence": risk_driven_canaries,
+            }
+        )
     if canary_mode == "lab":
         lab_setup = setup_lab_canaries(canary_dir, canary_url)
         lab_observation = observe_lab_canaries(lab_setup)
@@ -1460,10 +1798,12 @@ def layer4_canary_plan(canary_mode: str = "plan", canary_dir: Path | None = None
         "name": "Layer 4 - harmless canary impact validation",
         "mode": canary_mode,
         "canaries": canaries,
+        "risk_driven_canaries": risk_driven_canaries,
         "lab_setup": lab_setup,
         "lab_observation": lab_observation,
         "coverage": {
             "canaries_planned": len(canaries),
+            "risk_driven_canaries": len(risk_driven_canaries),
             "lab_enabled": canary_mode == "lab",
             "lab_ready": bool(lab_setup and lab_observation),
         },
@@ -1476,7 +1816,9 @@ def assess_tool_capabilities(report: dict[str, Any]) -> dict[str, Any]:
     l1, l2, l3, l4 = report["layers"]
     guard_runs = l2.get("skill_guard_engine", {}).get("runs", [])
     guard_completed = any(run.get("status") == "completed" for run in guard_runs)
+    agent_guard_completed = any(run.get("status") == "completed" and run.get("engine_name") == "agent-skill-guard" for run in guard_runs)
     guard_available = any(run.get("available") for run in guard_runs)
+    risk_context = l2.get("risk_context", {})
     dynamic_results = l3.get("method_probe_results", [])
     dynamic_mode = l3.get("dynamic_mode", "plan")
     canary_mode = l4.get("mode", "plan")
@@ -1487,19 +1829,19 @@ def assess_tool_capabilities(report: dict[str, Any]) -> dict[str, Any]:
             "layer": "第一层",
             "name": "安装态与状态面审计",
             "status": "已具备实扫能力",
-            "evidence": f"配置文件 {len(l1.get('config_files', []))} 个，SQLite 状态库 {len(l1.get('sqlite_files', []))} 个，配置语义记录 {len(l1.get('config_semantics', []))} 条。",
+            "evidence": f"配置文件 {len(l1.get('config_files', []))} 个，SQLite 状态库 {len(l1.get('sqlite_files', []))} 个，Agent/MCP 配置引用 {len(l1.get('agent_ecosystem_baseline', {}).get('references', []))} 个。",
             "maps_to": "对应并扩展焦糖布丁的配置/状态目录/默认运行态基线扫描。",
-            "advantage": "除发现项外，还抽取配置语义、数据库结构、文件权限和状态目录证据，适合做跨版本趋势分析。",
+            "advantage": "除发现项外，还抽取配置语义、数据库结构、文件权限、状态目录证据和 Agent/MCP 配置基线，适合做跨版本趋势分析。",
             "gap": "不替代人工判断业务配置是否符合部署策略。",
         },
         {
             "layer": "第二层",
-            "name": "Skill 生态与供应链审计",
-            "status": "轻量扫描可用，深度引擎按环境自动接入" if not guard_completed else "轻量扫描与 Skill Guard 深度引擎均已接入",
-            "evidence": f"轻量 Skill 扫描 {len(l2.get('skills', []))} 个；Skill Guard runs={len(guard_runs)}，available={guard_available}，completed={guard_completed}。",
-            "maps_to": "对应队友 Skill Guard 和 SkillDance 的 Skill 静态/供应链审计方向。",
-            "advantage": "第二层不是单独工具，而是纳入四层证据链；Skill 风险可继续流向第三层授权矩阵和第四层 canary 影响验证。",
-            "gap": "若本机无 cargo 或预编译 Skill Guard 二进制，深度引擎不会运行，但轻量扫描仍可用。",
+            "name": "Skill / Agent 生态与供应链审计",
+            "status": "轻量扫描可用，Agent Skill Guard 按环境自动接入" if not guard_completed else ("轻量扫描与新版 Agent Skill Guard 均已接入" if agent_guard_completed else "轻量扫描与深度引擎均已接入"),
+            "evidence": f"轻量 Skill 扫描 {len(l2.get('skills', []))} 个；deep runs={len(guard_runs)}，available={guard_available}，completed={guard_completed}；AI BOM packages={risk_context.get('ai_bom_packages', 0)}，MCP findings={risk_context.get('mcp_findings', 0)}。",
+            "maps_to": "对应并升级队友 Skill Guard/SkillDance 的 Skill 静态、供应链、Agent/MCP 生态审计方向。",
+            "advantage": "第二层新版深度引擎输出 AI BOM、MCP schema、隐藏指令、claims-vs-evidence 和 toxic flow，并继续流向第三层授权矩阵和第四层 canary 影响验证。",
+            "gap": "若本机无新版 Agent Skill Guard 二进制，会自动降级为轻量扫描；远程输入由策略配置控制。",
         },
         {
             "layer": "第三层",
@@ -1507,23 +1849,23 @@ def assess_tool_capabilities(report: dict[str, Any]) -> dict[str, Any]:
             "status": "已进入动态授权探测" if dynamic_mode == "probe" and dynamic_results else "已生成授权矩阵，动态探测需启用 --dynamic-mode probe",
             "evidence": f"授权矩阵 {len(l3.get('authorization_matrix', []))} 行；动态模式={dynamic_mode}；方法探测结果 {len(dynamic_results)} 条。",
             "maps_to": "这是焦糖布丁、Skill Guard、SkillDance 通常不覆盖的连接后授权逻辑层。",
-            "advantage": "围绕 Host/Origin/loopback/nip.io/trusted proxy/WebSocket upgrade，对 sessions/config/node/browser/files/memory/tasks/flows 等方法族做差异矩阵。",
+            "advantage": "围绕 Host/Origin/loopback/nip.io/trusted proxy/WebSocket upgrade，对 sessions/config/node/browser/files/memory/tasks/flows 等方法族做差异矩阵，并根据第二层 Agent/Skill 风险标记优先方法族。",
             "gap": "动态探测默认只做 metadata/dry-run，不会执行高影响能力；发现 accepted 仍需人工复核授权语义。",
         },
         {
             "layer": "第四层",
             "name": "Canary 影响面验证",
             "status": "已完成本地 lab canary 自检" if lab_ready else "已生成 canary 验证计划，lab 模式需启用 --canary-mode lab",
-            "evidence": f"Canary 模式={canary_mode}；lab_ready={lab_ready}。",
+            "evidence": f"Canary 模式={canary_mode}；lab_ready={lab_ready}；风险驱动 canary={len(l4.get('risk_driven_canaries', []))} 个。",
             "maps_to": "超过传统静态扫描，面向能力触达链路验证。",
-            "advantage": "用 synthetic 文件、SQLite、网络观察点和任务 dry-run 思路验证风险是否继续触达高价值能力面。",
+            "advantage": "用 synthetic 文件、SQLite、网络观察点、任务 dry-run 和 Agent/MCP/prompt 风险驱动 canary 思路验证风险是否继续触达高价值能力面。",
             "gap": "默认不读取真实用户文件、不访问第三方网络、不创建持久任务；真实影响验证应在授权实验环境中完成。",
         },
     ]
 
     exceeds = [
         "相对焦糖布丁：保留配置/状态目录基线价值，并增加连接后方法授权矩阵与 canary 影响验证。",
-        "相对队友 Skill Guard：保留其 Skill 深度审计能力，并把 Skill 结果纳入四层证据链。",
+        "相对队友 Skill Guard：升级为 Agent Skill Guard 深度审计能力，并把 AI BOM/MCP/hidden instruction/toxic flow 结果纳入四层证据链。",
         "相对 SkillDance：覆盖 Skill 声明/实现差异方向，同时补上 Gateway、状态数据库、动态授权和能力触达链路。",
     ]
     dynamic_statement = (
@@ -1544,7 +1886,7 @@ def assess_tool_capabilities(report: dict[str, Any]) -> dict[str, Any]:
         "capability_chain": chain_statement,
         "github_readiness": [
             "Python 标准库实现主扫描和 Web 前端，默认无需第三方 Python 依赖。",
-            "Skill Guard 深度引擎作为 engines/skill-guard 内置源码保留；有 cargo 或预编译二进制时自动运行，没有时降级为轻量 Skill 扫描并在报告中说明。",
+            "Agent Skill Guard 新版深度引擎作为 engines/agent-skill-guard/bin 接入；没有二进制时降级为轻量 Skill/Agent 扫描并在报告中说明。",
             "reports/ 默认被 .gitignore 忽略，仓库可保持干净；运行后报告保存在本地 reports/。",
         ],
     }
@@ -1614,13 +1956,16 @@ def build_overall_assessment(report: dict[str, Any]) -> dict[str, Any]:
     lab_ready = bool(l4.get("lab_setup") and l4.get("lab_observation"))
     guard_runs = l2.get("skill_guard_engine", {}).get("runs", [])
     guard_completed = any(run.get("status") == "completed" for run in guard_runs)
+    agent_guard_completed = any(run.get("status") == "completed" and run.get("engine_name") == "agent-skill-guard" for run in guard_runs)
+    risk_context = l2.get("risk_context", {})
 
     l1_score = layer_score(l1)
     if l1.get("sqlite_files"):
         l1_score = clamp(l1_score - min(20, 5 * len(l1.get("sqlite_files", []))))
     if not counts.get("critical", 0) and visible_findings(l1):
         l1_score = max(l1_score, 22)
-    l2_score = layer_score(l2, base=92 if guard_completed else 74)
+    l2_base = 96 if agent_guard_completed else (88 if guard_completed else 74)
+    l2_score = layer_score(l2, base=l2_base)
     if not l2.get("skills") and not guard_completed:
         l2_score = clamp(l2_score - 10)
     l3_score = layer_score(l3, base=92 if dynamic_mode == "probe" and dynamic_results else 62)
@@ -1633,16 +1978,18 @@ def build_overall_assessment(report: dict[str, Any]) -> dict[str, Any]:
     evidence_score = 55
     evidence_score += 10 if l1.get("config_semantics") else 0
     evidence_score += 10 if l1.get("sqlite_files") else 0
+    evidence_score += 10 if agent_guard_completed else 0
+    evidence_score += 6 if risk_context.get("ai_bom_packages") else 0
     evidence_score += 15 if dynamic_results else 0
     evidence_score += 10 if lab_ready else 0
     evidence_score = clamp(evidence_score)
 
     metrics = [
-        {"key": "baseline", "label": "配置状态", "score": l1_score, "note": f"配置 {len(l1.get('config_files', []))} 个，SQLite {len(l1.get('sqlite_files', []))} 个"},
-        {"key": "skill", "label": "Skill治理", "score": l2_score, "note": f"Skill {len(l2.get('skills', []))} 个，深度引擎={'已运行' if guard_completed else '未完成'}"},
-        {"key": "authz", "label": "动态授权", "score": l3_score, "note": f"矩阵 {len(l3.get('authorization_matrix', []))} 行，探测 {len(dynamic_results)} 条"},
-        {"key": "canary", "label": "影响验证", "score": l4_score, "note": f"canary 模式={l4.get('mode')}，lab_ready={lab_ready}"},
-        {"key": "evidence", "label": "证据完整度", "score": evidence_score, "note": "配置、状态库、动态探测和 canary 证据综合"},
+        {"key": "baseline", "label": "配置状态", "score": l1_score, "note": f"配置 {len(l1.get('config_files', []))} 个，SQLite {len(l1.get('sqlite_files', []))} 个，Agent/MCP 引用 {len(l1.get('agent_ecosystem_baseline', {}).get('references', []))} 个"},
+        {"key": "skill", "label": "Agent治理", "score": l2_score, "note": f"Skill {len(l2.get('skills', []))} 个，新版深度引擎={'已运行' if agent_guard_completed else '未完成'}，AI BOM {risk_context.get('ai_bom_packages', 0)}"},
+        {"key": "authz", "label": "动态授权", "score": l3_score, "note": f"矩阵 {len(l3.get('authorization_matrix', []))} 行，风险驱动族 {len(l3.get('risk_driven_matrix', {}).get('families', []))} 个，探测 {len(dynamic_results)} 条"},
+        {"key": "canary", "label": "影响验证", "score": l4_score, "note": f"canary 模式={l4.get('mode')}，风险驱动 {len(l4.get('risk_driven_canaries', []))} 个，lab_ready={lab_ready}"},
+        {"key": "evidence", "label": "证据完整度", "score": evidence_score, "note": "配置、状态库、Agent 深度审计、动态探测和 canary 证据综合"},
     ]
 
     average_score = clamp(sum(item["score"] for item in metrics) / len(metrics))
@@ -1681,8 +2028,12 @@ def build_overall_assessment(report: dict[str, Any]) -> dict[str, Any]:
         priority_actions.append("对返回 accepted 的方法族做人工复核，确认是否只是元数据接口，还是存在越权调用入口。")
     if "L3-CONDITION-DIFFERENCE" in finding_ids:
         priority_actions.append("对 Host/Origin/trusted proxy 条件差异进行复测，确认网络层 trusted/local 结论是否被错误继承。")
+    if "L2-AGENT-TOXIC-FLOW" in finding_ids:
+        priority_actions.append("优先复核第二层 toxic flow：确认不可信输入、敏感数据面与外联/执行能力是否真的形成可达链路。")
+    if "L2-MCP-TOOL-SCHEMA-RISK" in finding_ids:
+        priority_actions.append("复核 MCP tool schema、command/env 绑定和来源身份，必要时关闭危险命令或收敛环境变量传递。")
     if not guard_completed:
-        priority_actions.append("补充 cargo 或预编译 Skill Guard 二进制，使第二层 Skill 深度审计从降级模式进入完整模式。")
+        priority_actions.append("补充新版 Agent Skill Guard 二进制或确认 engines/agent-skill-guard/bin，使第二层深度审计从降级模式进入完整模式。")
     if not lab_ready:
         priority_actions.append("在授权实验环境中启用 canary lab，将动态授权结果与文件/网络/任务/数据库能力面联动。")
     if not priority_actions:
@@ -1724,8 +2075,28 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     skill_root = Path(args.skill_root).expanduser() if args.skill_root else None
     canary_dir = Path(args.canary_dir).expanduser() if args.canary_dir else None
     baseline_report = Path(args.baseline_report).expanduser() if args.baseline_report else None
+    l1 = layer1_baseline(openclaw_home)
+    l2 = layer2_skill_supply_chain(
+        skill_root,
+        openclaw_home,
+        args.skill_guard_engine,
+        agent_ecosystem=getattr(args, "agent_ecosystem", True),
+        deep_engine_timeout=getattr(args, "deep_engine_timeout", 120),
+    )
+    risk_context = l2.get("risk_context", {})
+    l3 = run_layer3_trust_boundary(
+        args.gateway_url,
+        args.browser_url,
+        args.dynamic_mode,
+        args.probe_timeout,
+        args.method_probe_limit,
+        args.rpc_paths.split(",") if args.rpc_paths else MODULE_DEFAULT_RPC_PATHS,
+        version=VERSION,
+        risk_context=risk_context,
+    )
+    l4 = layer4_canary_plan(args.canary_mode, canary_dir, args.canary_url, risk_context)
     report = {
-        "reportVersion": "1.1.0",
+        "reportVersion": "1.2.0",
         "tool": {"name": "ClawMatrix", "version": VERSION},
         "generated_at": utc_now(),
         "subject": {
@@ -1735,23 +2106,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "browser_url": args.browser_url,
             "dynamic_mode": args.dynamic_mode,
             "canary_mode": args.canary_mode,
+            "agent_ecosystem": getattr(args, "agent_ecosystem", True),
             "include_clean_sections": args.include_clean_sections,
             "baseline_report": str(baseline_report) if baseline_report else None,
         },
-        "layers": [
-            layer1_baseline(openclaw_home),
-            layer2_skill_supply_chain(skill_root, openclaw_home, args.skill_guard_engine),
-            run_layer3_trust_boundary(
-                args.gateway_url,
-                args.browser_url,
-                args.dynamic_mode,
-                args.probe_timeout,
-                args.method_probe_limit,
-                args.rpc_paths.split(",") if args.rpc_paths else MODULE_DEFAULT_RPC_PATHS,
-                version=VERSION,
-            ),
-            layer4_canary_plan(args.canary_mode, canary_dir, args.canary_url),
-        ],
+        "layers": [l1, l2, l3, l4],
     }
     report["summary"] = summarize(report)
     report["capability_assessment"] = assess_tool_capabilities(report)
@@ -1870,11 +2229,25 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- **覆盖率：** `{json.dumps(l2.get('coverage', {}), ensure_ascii=False)}`")
         lines.append(f"- Skill 根目录：`{', '.join(l2.get('roots', [])) if l2.get('roots') else '无'}`")
         lines.append(f"- 已检查 Skill 数量：`{len(l2.get('skills', []))}`")
+        risk_context = l2.get("risk_context", {})
+        if risk_context:
+            lines.append(
+                "- 第二层联动摘要："
+                f"AI BOM packages=`{risk_context.get('ai_bom_packages', 0)}`，"
+                f"MCP findings=`{risk_context.get('mcp_findings', 0)}`，"
+                f"hidden signals=`{risk_context.get('hidden_instruction_signals', 0)}`，"
+                f"toxic flows=`{risk_context.get('toxic_flows_count', 0)}`，"
+                f"observed=`{risk_context.get('observed_capabilities', [])}`"
+            )
         guard_runs = l2.get("skill_guard_engine", {}).get("runs", [])
         if guard_runs:
-            lines.append(f"- Skill Guard 深度引擎运行次数：`{len(guard_runs)}`")
+            lines.append(f"- Agent Skill Guard 深度引擎运行次数：`{len(guard_runs)}`")
             for guard in guard_runs:
-                lines.append(f"- 深度引擎目标：`{guard['target']}` 状态=`{guard['status']}` 可用=`{guard['available']}`")
+                normalized = guard.get("normalized", {})
+                lines.append(
+                    f"- 深度引擎目标：`{guard['target']}` 引擎=`{guard.get('engine_name')}` 状态=`{guard['status']}` 可用=`{guard['available']}` "
+                    f"verdict=`{normalized.get('verdict')}` score=`{normalized.get('score')}` 摘要=`{normalized.get('summary_zh') or '-'}`"
+                )
         for skill in l2.get("skills", [])[:30]:
             lines.append(
                 f"- `{skill.get('skill', '-')}` 风险=`{SEVERITY_ZH.get(skill.get('severity', 'info'), skill.get('severity', 'info'))}` 声明能力=`{skill.get('declared_capabilities', [])}` 观察能力=`{skill.get('observed_capabilities', [])}` 差异=`{skill.get('capability_mismatch', [])}`"
@@ -1889,6 +2262,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- **覆盖率：** `{json.dumps(l3.get('coverage', {}), ensure_ascii=False)}`")
         lines.append(f"- 动态模式：`{l3.get('dynamic_mode', 'plan')}`")
         lines.append(f"- 已生成授权矩阵行数：`{len(l3.get('authorization_matrix', []))}`")
+        lines.append(f"- 风险驱动方法族：`{l3.get('risk_driven_matrix', {}).get('families', [])}`")
         lines.append(f"- 方法探测结果：`{l3.get('method_probe_summary', {}).get('by_classification', {})}`")
         for probe in l3.get("http_probes", []):
             lines.append(f"- 探测 `{probe['url']}` 可达=`{probe.get('reachable')}` 状态码=`{probe.get('status', '-')}`")
@@ -1901,6 +2275,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         if l4.get("skipped_reason"): lines.append(f"- **跳过执行原因：** {l4['skipped_reason']}")
         lines.append(f"- **覆盖率：** `{json.dumps(l4.get('coverage', {}), ensure_ascii=False)}`")
         lines.append(f"- Canary 模式：`{l4.get('mode')}`")
+        lines.append(f"- 风险驱动 Canary：`{[item.get('id') for item in l4.get('risk_driven_canaries', [])]}`")
         if l4.get("lab_setup"):
             lines.append(f"- 实验 canary：`{l4['lab_setup']}`")
         for canary in l4.get("canaries", []):
@@ -2058,6 +2433,16 @@ def render_html(report: dict[str, Any]) -> str:
             "</tr>"
         )
 
+    agent_ref_rows = []
+    for ref in l1.get("agent_ecosystem_baseline", {}).get("references", [])[:30]:
+        agent_ref_rows.append(
+            "<tr>"
+            f"<td>{html_escape(ref.get('relative_path', ref.get('path', '-')))}</td>"
+            f"<td>{html_escape(', '.join(ref.get('signals', [])) or '-')}</td>"
+            f"<td>{html_escape(ref.get('size', '-'))}</td>"
+            "</tr>"
+        )
+
     skill_rows = []
     for skill in l2.get("skills", [])[:80]:
         frontmatter_info = "解析成功" if skill.get("frontmatter", {}).get("present") else "无"
@@ -2078,14 +2463,40 @@ def render_html(report: dict[str, Any]) -> str:
 
     guard_rows = []
     for guard in l2.get("skill_guard_engine", {}).get("runs", []):
+        normalized = guard.get("normalized", {})
+        summary_text = (
+            f"引擎={guard.get('engine_name') or '-'}；"
+            f"verdict={normalized.get('verdict') or '-'}；"
+            f"score={normalized.get('score') if normalized.get('score') is not None else '-'}；"
+            f"AI BOM={normalized.get('ai_bom_packages', 0)}；"
+            f"MCP={normalized.get('mcp_findings', 0)}；"
+            f"toxic={normalized.get('toxic_flows_count', 0)}；"
+            f"{normalized.get('summary_zh') or ''}"
+        )
         guard_rows.append(
             "<tr>"
             f"<td>{html_escape(guard.get('target', '-'))}</td>"
             f"<td>{html_escape(guard.get('status', '-'))}</td>"
             f"<td>{html_escape('是' if guard.get('available') else '否')}</td>"
-            f"<td>{html_escape(guard.get('error') or '-')}</td>"
+            f"<td>{html_escape(guard.get('error') or summary_text or '-')}</td>"
             "</tr>"
         )
+
+    l2_risk = l2.get("risk_context", {})
+    l2_risk_html = ""
+    if l2_risk:
+        l2_risk_html = f"""
+        <div class="analysis-box">
+          <p><b>新版 Agent Skill Guard 联动摘要：</b>
+          AI BOM packages={html_escape(l2_risk.get('ai_bom_packages', 0))}；
+          Agent packages={html_escape(l2_risk.get('agent_packages', 0))}；
+          MCP findings={html_escape(l2_risk.get('mcp_findings', 0))}；
+          hidden signals={html_escape(l2_risk.get('hidden_instruction_signals', 0))}；
+          toxic flows={html_escape(l2_risk.get('toxic_flows_count', 0))}；
+          observed={html_escape(l2_risk.get('observed_capabilities', []))}</p>
+          <p><b>Top risks：</b>{html_escape('；'.join(l2_risk.get('top_risks', [])[:8]) or '-')}</p>
+        </div>
+        """
 
     probe_rows = []
     for probe in l3.get("http_probes", []):
@@ -2196,6 +2607,8 @@ def render_html(report: dict[str, Any]) -> str:
       <table><thead><tr><th>配置</th><th>版本</th><th>安全信号</th></tr></thead><tbody>{''.join(config_rows) or '<tr><td colspan="3">未发现 openclaw.json</td></tr>'}</tbody></table>
       <h3>SQLite 状态库</h3>
       <table><thead><tr><th>路径</th><th>权限</th><th>风险</th><th>表结构摘要</th><th>大小</th></tr></thead><tbody>{''.join(db_rows) or '<tr><td colspan="5">未发现 SQLite 状态库</td></tr>'}</tbody></table>
+      <h3>Agent/MCP 配置基线</h3>
+      <table><thead><tr><th>配置引用</th><th>信号</th><th>大小</th></tr></thead><tbody>{''.join(agent_ref_rows) or '<tr><td colspan="3">未发现 Agent/MCP 配置引用</td></tr>'}</tbody></table>
     </section>"""
         )
 
@@ -2210,9 +2623,10 @@ def render_html(report: dict[str, Any]) -> str:
             f"""
     <section>
       <h2><span class="phase">2</span>{LAYER_LABELS[1]}</h2>
-      <p class="muted">检查 Skill 声明能力与实现行为是否一致，并识别文件、网络、进程、浏览器、计划任务和 prompt injection 等风险信号。本层包含 ClawMatrix 轻量识别和内置 Skill Guard 深度引擎。</p>
+      <p class="muted">检查 Skill/Agent 声明能力与实现行为是否一致，并识别文件、网络、进程、浏览器、计划任务、prompt injection、MCP schema、AI BOM、隐藏指令和 toxic flow 等风险信号。本层包含 ClawMatrix 轻量识别和新版 Agent Skill Guard 深度引擎。</p>
       {l2_meta_html}
-      <h3>Skill Guard 深度引擎</h3>
+      {l2_risk_html}
+      <h3>Agent Skill Guard 深度引擎</h3>
       <table><thead><tr><th>目标</th><th>状态</th><th>可用</th><th>说明</th></tr></thead><tbody>{''.join(guard_rows) or '<tr><td colspan="4">未运行深度引擎</td></tr>'}</tbody></table>
       <h3>ClawMatrix 轻量能力识别</h3>
       <table><thead><tr><th>Skill</th><th>风险</th><th>声明能力</th><th>观察能力</th><th>能力差异</th></tr></thead><tbody>{''.join(skill_rows) or '<tr><td colspan="5">未发现可扫描 Skill</td></tr>'}</tbody></table>
@@ -2235,6 +2649,7 @@ def render_html(report: dict[str, Any]) -> str:
             <li><b>Method Family 数量：</b> {method_families_count}</li>
             <li><b>实际 Probe 结果数：</b> {probe_results_count}</li>
             <li><b>Condition Difference 数量：</b> {condition_diff_count}</li>
+            <li><b>第二层风险驱动方法族：</b> {html_escape(l3.get("risk_driven_matrix", {}).get("families", []))}</li>
         </ul>
         """
         
@@ -2454,10 +2869,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gateway-url", default=None, help="Optional safe HTTP probe URL, e.g. http://127.0.0.1:18789/")
     parser.add_argument("--browser-url", default=None, help="Optional safe browser sidecar probe URL, e.g. http://127.0.0.1:18791/")
     parser.add_argument(
-        "--skill-guard-engine",
+        "--agent-guard-engine",
+        dest="skill_guard_engine",
         choices=["auto", "off", "on"],
         default="auto",
-        help="Whether to run the embedded Rust Skill Guard engine for layer-2 deep skill audit.",
+        help="Whether to run the layer-2 Agent Skill Guard deep engine. Missing engine degrades to lightweight scan.",
+    )
+    parser.add_argument(
+        "--skill-guard-engine",
+        dest="skill_guard_engine",
+        choices=["auto", "off", "on"],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--agent-ecosystem",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable generic Agent/MCP/prompt package parsing in the Agent Skill Guard deep engine.",
+    )
+    parser.add_argument(
+        "--deep-engine-timeout",
+        type=int,
+        default=120,
+        help="Timeout in seconds for each layer-2 deep engine run.",
     )
     parser.add_argument(
         "--dynamic-mode",
