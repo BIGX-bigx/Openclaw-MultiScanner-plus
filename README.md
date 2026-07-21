@@ -1,63 +1,87 @@
 # Openclaw-MultiScanner Plus
 
-Openclaw-MultiScanner Plus 是一个面向 OpenClaw 的多阶段融合型信任边界扫描器。它不是单一的配置检查器，也不是单一的 Skill 扫描器，而是按四层架构组织 OpenClaw 的状态目录、Skill / Agent 生态、连接后方法授权矩阵和 canary 影响面验证计划。
+Openclaw-MultiScanner Plus 是一款面向 OpenClaw 的多阶段信任边界安全扫描工具。工具围绕 OpenClaw 的安装状态、Skill / Agent 生态、连接后方法授权边界和 Canary 影响面验证构建四层联动扫描架构，用于发现配置暴露、状态面风险、Agent 能力越界、供应链隐患、RPC / WebSocket 授权差异以及高价值能力触达链路。
 
-Plus 版重点改进报告阅读体验：在详细四层结果之前增加“综合态势评估”，自动生成风险指数、智能评价、优先处理建议、五维能力值雷达图，并默认省略无明显问题的层级详情，避免高阶 OpenClaw 环境扫描量过大时报告难以翻阅。
+当前版本为 v2.0 稳定优化版，已接入新版 Agent Skill Guard 深度引擎，并对 Web 控制台扫描流程进行了优化：扫描时优先生成统一 JSON 证据对象，再由同一份证据渲染 HTML 与 Markdown 报告，避免重复扫描导致的超时和报告不一致问题。
 
-## 功能范围
+## 核心扫描架构
 
-- 第一层：安装态与状态面审计。检查 `openclaw.json`、模型配置、认证文件、device identity、日志、资源状态、SQLite 状态数据库和 Agent/MCP 本地配置基线。
-- 第二层：Skill / Agent 生态与供应链审计。检查 `SKILL.md` 声明能力与实现行为差异，识别文件、网络、进程、浏览器、计划任务、prompt injection、MCP schema、AI BOM、隐藏指令和 toxic flow 信号。
-- 第三层：连接后信任边界与方法授权验证。生成 Host、Origin、loopback、nip.io、trusted proxy、WebSocket upgrade 条件下的方法族授权矩阵，并根据第二层风险上下文标记优先验证的方法族。
-- 第四层：Canary 影响面验证。生成文件、网络、任务、状态数据库、记忆能力面，以及 MCP / prompt / browser / egress 等风险驱动 canary 验证计划。
+Openclaw-MultiScanner Plus 采用四层扫描模型：
 
-2.0 版本开始，四层都具备实际证据输出，并在 HTML 报告中加入综合态势评估、智能评价和五维能力值面板：
+1. **安装态与状态面审计**
 
-- 第一层会解析 `openclaw.json` 语义信号、状态目录布局、日志、备份、哈希基线、SQLite 数据价值和 Agent/MCP 配置引用。
-- 第二层会在轻量扫描中识别声明/实现差异、依赖风险、远程安装、分阶段投递、混淆、凭证访问和外送信号；同时优先接入新版 Agent Skill Guard 深度引擎，输出中文摘要、AI BOM、MCP tool/schema 审计、hidden instruction、claims-vs-evidence、toxic flow 和 policy gate 结果。
-- 第三层支持 `--dynamic-mode probe`，对常见 HTTP JSON-RPC / WebSocket 路径执行 metadata/dry-run 方法探测，并输出条件差异矩阵；同时读取第二层 `risk_context` 生成风险驱动授权矩阵。
-- 第四层支持 `--canary-mode lab`，布置本地 synthetic 文件和 SQLite canary，完成自检观测，并根据第二层 `risk_context` 生成风险驱动 canary。
-- 报告首页会给出综合等级、风险指数、风险集中层、优先处理建议和正五边形雷达图。
-- 默认报告为智能精简模式，只展开存在非信息级发现或覆盖不足的层；需要完整详情时可添加 `--include-clean-sections`。
+   检查 OpenClaw 状态目录、`openclaw.json`、模型配置、认证文件、设备身份、日志、备份、哈希基线和 SQLite 状态数据库，建立运行环境安全基准。
+
+2. **Skill / Agent 生态与供应链审计**
+
+   分析 `SKILL.md` 声明能力、实现行为、依赖文件、MCP / Agent 配置、隐藏指令、prompt injection、远程安装、分阶段投递、凭证访问和外送风险。该层包含 ClawMatrix 轻量扫描逻辑和内置 Agent Skill Guard v2 深度引擎。
+
+3. **连接后信任边界与方法授权验证**
+
+   围绕 Gateway、JSON-RPC、WebSocket 和 Browser Control 生成方法级授权矩阵，覆盖 Host、Origin、loopback、nip.io、trusted proxy、WebSocket upgrade 等条件，用于判断连接建立后权限是否被正确保留。
+
+4. **Canary 影响面验证**
+
+   根据前序风险证据生成无害 Canary 验证点，用于评估文件、网络、任务、状态数据库、浏览器控制和记忆能力等高价值能力面的实际影响链路。
+
+## v2.0 版本特性
+
+- 四层联动扫描：从静态配置、Agent 生态、动态授权到影响验证形成完整证据链。
+- 新版第二层深度引擎：内置 Agent Skill Guard v2，支持 AI BOM、MCP schema 审计、隐藏指令、声明/实现差异、toxic flow 和策略门禁。
+- 统一证据模型：所有扫描结果进入 JSON 证据对象，再派生 HTML 和 Markdown 报告。
+- 稳定优化报告生成：Web 控制台只执行一次核心扫描，避免 HTML / JSON / Markdown 重复扫描。
+- 中文可视化报告：提供综合态势评估、风险指数、智能评价、优先处理建议和五维能力雷达图。
+- 智能精简模式：默认仅展开存在风险或覆盖不足的层级，降低大型环境下报告阅读成本。
+- 历史报告管理：本地保存历史 HTML、JSON、Markdown 报告，支持预览、下载、删除和多报告对比。
+- 第二层独立入口：Web 控制台提供 Agent Skill Guard 深度引擎单独扫描入口。
+- Windows 可执行交付：支持通过 `OpenClaw-MultiScanner-plus.exe` 启动本地 Web 控制台。
 
 ## 目录结构
 
 ```text
-Openclaw-MultiScanner/
+Openclaw-MultiScanner-plus/
   tools/
-    clawmatrix_scan.py      # 命令行扫描器
-    clawmatrix_web.py       # 本地 Web 前端
-    doctor.py               # 环境自检
+    clawmatrix_scan.py          # 命令行四层扫描器
+    clawmatrix_web.py           # 本地 Web 控制台
+    doctor.py                   # 环境自检工具
+    clawmatrix/
+      layer3.py                 # 第三层信任边界与方法授权逻辑
+      report_diff.py            # 报告对比逻辑
+      skill_analysis.py         # 第二层轻量 Skill / Agent 分析逻辑
+
+  engines/
+    agent-skill-guard/
+      bin/
+        agent-skill-guard.exe   # 第二层 Agent Skill Guard v2 深度引擎
+      schemas/
+        report.schema.json
+      .openclaw-guard.yml
+
   schemas/
     clawmatrix-report.schema.json
+
   canary_templates/
     canary-plan.yaml
-  engines/
-    agent-skill-guard/        # 新版 Agent Skill Guard 深度引擎，第二层优先使用
+
   docs/
     architecture.md
+
   reports/
-    .gitkeep
-  start-web.ps1
-  start-web.sh
-  .gitignore
+    .gitkeep                    # 本地报告输出目录
+
+  start-web.ps1                 # Windows 启动脚本
+  start-web.sh                  # Linux / WSL 启动脚本
   README.md
 ```
-
-## Plus 版报告特性
-
-- 综合态势评估：将四层扫描结果汇总成一个整体风险等级。
-- 智能评价：根据实际发现自动生成不同评价，不再使用固定模板话术。
-- 优先处理建议：按发现项自动给出复核顺序。
-- 五维能力值面板：覆盖配置状态、Agent 治理、动态授权、影响验证、证据完整度。
-- 跨层联动摘要：第二层 Agent Skill Guard 的 AI BOM、MCP、隐藏指令、toxic flow 结果会驱动第三层授权矩阵和第四层 canary 计划。
-- 智能精简详情：默认省略无明显问题的层，降低大型环境下报告阅读成本。
 
 ## 环境要求
 
 - Python 3.9+
-- 不需要安装第三方依赖
 - Windows、Linux、WSL 均可运行
+- 默认不要求额外安装第三方依赖
+- 第二层深度引擎已以内置二进制形式提供，无需用户自行编译
+
+如果第二层深度引擎不可用，工具不会整体失败，会自动降级为 ClawMatrix 轻量扫描，并在报告中记录原因。
 
 ## 一键自检
 
@@ -70,17 +94,27 @@ python3 tools/doctor.py \
   --browser-url http://127.0.0.1:18791/
 ```
 
-Windows PowerShell 可使用：
+Windows PowerShell 示例：
 
 ```powershell
 python .\tools\doctor.py --openclaw-home "$env:USERPROFILE\.openclaw"
 ```
 
-自检会确认 Python、OpenClaw CLI、状态目录、Gateway、browser-control 和新版 Agent Skill Guard 二进制是否可用。即使深度引擎不可用，工具也不会整体失效，只会把第二层降级为 ClawMatrix 轻量 Skill/Agent 扫描，并在报告中说明。
+如果 OpenClaw 部署在 WSL / Ubuntu 中，可以填写 Windows 可访问的 UNC 路径，例如：
+
+```text
+\\wsl.localhost\Ubuntu\home\username\.openclaw
+```
+
+Skill / Agent 根目录可填写：
+
+```text
+\\wsl.localhost\Ubuntu\home\username\.openclaw\skills
+```
 
 ## 命令行使用
 
-在 OpenClaw 所在环境中运行：
+基础扫描：
 
 ```bash
 python3 tools/clawmatrix_scan.py \
@@ -100,23 +134,7 @@ python3 tools/clawmatrix_scan.py \
   --out reports/clawmatrix_latest.json
 ```
 
-启用第三层动态安全探测和第四层实验 canary：
-
-```bash
-python3 tools/clawmatrix_scan.py \
-  --openclaw-home ~/.openclaw \
-  --gateway-url http://127.0.0.1:18789/ \
-  --browser-url http://127.0.0.1:18791/ \
-  --dynamic-mode probe \
-  --method-probe-limit 16 \
-  --canary-mode lab \
-  --format html \
-  --out reports/clawmatrix_dynamic.html
-```
-
-`--dynamic-mode probe` 只发送 metadata/dry-run 类 JSON-RPC 探测，不执行命令、不创建任务、不读取真实敏感文件。`--method-probe-limit 0` 表示探测完整矩阵。
-
-导出 Markdown：
+导出 Markdown 报告：
 
 ```bash
 python3 tools/clawmatrix_scan.py \
@@ -125,32 +143,43 @@ python3 tools/clawmatrix_scan.py \
   --out reports/clawmatrix_latest.md
 ```
 
-如需扫描 Skill 根目录：
+扫描 Skill / Agent 根目录：
 
 ```bash
 python3 tools/clawmatrix_scan.py \
   --openclaw-home ~/.openclaw \
-  --skill-root /path/to/skills \
-  --agent-guard-engine auto \
-  --agent-ecosystem \
+  --skill-root ~/.openclaw/skills \
+  --skill-guard-engine auto \
   --format html \
   --out reports/clawmatrix_with_skills.html
 ```
 
-`--agent-guard-engine` 支持三种模式：
+启用第三层动态 Probe 和第四层 Canary Lab：
 
-- `auto`：默认模式。调用 `engines/agent-skill-guard/bin/agent-skill-guard`；不可用时自动降级为轻量扫描。
-- `off`：只运行 ClawMatrix 轻量 Skill 识别。
-- `on`：强制尝试运行第二层深度引擎，失败会在报告中记录原因。
+```bash
+python3 tools/clawmatrix_scan.py \
+  --openclaw-home ~/.openclaw \
+  --skill-root ~/.openclaw/skills \
+  --gateway-url http://127.0.0.1:18789/ \
+  --browser-url http://127.0.0.1:18791/ \
+  --skill-guard-engine auto \
+  --dynamic-mode probe \
+  --method-probe-limit 16 \
+  --canary-mode lab \
+  --include-clean-sections \
+  --format html \
+  --out reports/clawmatrix_dynamic.html
+```
 
-旧参数名 `--skill-guard-engine` 仍保留为兼容别名，便于旧脚本平滑迁移。
+`--dynamic-mode probe` 只执行安全的 metadata / dry-run 类探测，不执行真实命令、不创建持久任务、不读取真实敏感文件。`--method-probe-limit 0` 表示探测完整矩阵。
 
-新版第二层相关参数：
+`--skill-guard-engine` 支持三种模式：
 
-- `--agent-ecosystem` / `--no-agent-ecosystem`：是否启用通用 Agent / MCP / prompt package 生态解析，默认启用。
-- `--deep-engine-timeout 120`：设置每个第二层深度引擎运行的超时时间，单位为秒。
+- `auto`：默认模式，自动使用内置 Agent Skill Guard v2 深度引擎。
+- `off`：关闭深度引擎，仅运行 ClawMatrix 轻量扫描。
+- `on`：强制尝试运行深度引擎，失败时在报告中记录原因。
 
-## 图形化使用
+## Web 控制台使用
 
 Linux / WSL：
 
@@ -170,23 +199,103 @@ Windows PowerShell：
 http://127.0.0.1:8765/
 ```
 
-页面中可以填写 OpenClaw 状态目录、Gateway 地址、browser-control 地址，并生成中文 HTML、JSON 或 Markdown 报告。Web 控制台会优先使用新版 Agent Skill Guard 深度引擎，并在环境自检中显示接入状态。
+Web 控制台包含：
 
-页面内置两个预设：
+- 首页概览：展示四层扫描架构和快速启动入口。
+- 扫描配置：配置 OpenClaw 状态目录、Skill / Agent 根目录、Gateway、Browser Control、第二层深度引擎、第三层 Probe、第四层 Canary。
+- 第二层深度引擎：单独运行 Agent Skill Guard v2。
+- 启动扫描：确认配置后执行多层级扫描。
+- 报告分析：预览 HTML 报告，管理历史记录，下载 HTML、JSON、Markdown，支持多报告对比。
 
-- 快速体检：偏静态，适合日常确认环境和配置风险。
-- 研究增强模式：启用第三层 metadata/dry-run 动态探测和第四层本机 synthetic canary，更适合课题组汇报和版本对比。
+## 推荐配置
+
+日常稳定体检：
+
+```text
+L2 Agent Skill Guard v2：auto
+L2 Agent/MCP 生态解析：启用
+L2 深度引擎超时：120
+L3 运行时授权验证：Plan 模式
+L4 Canary 验证：Plan 模式
+报告展示策略：智能精简
+```
+
+完整深度测试：
+
+```text
+L2 Agent Skill Guard v2：auto
+L2 Agent/MCP 生态解析：启用
+L2 深度引擎超时：180 或 240
+L3 运行时授权验证：Probe 模式
+L4 Canary 验证：Lab 模式
+报告展示策略：完整模式
+```
+
+完整 Probe / Lab 模式依赖 OpenClaw Gateway、Browser Control、Skill / Agent 目录和 Canary 实验目录配置正确。若环境不完整，工具仍可生成报告，但部分层级会以覆盖不足或跳过原因体现。
+
+## Windows 可执行包
+
+Windows 可执行交付包中包含：
+
+```text
+OpenClaw-MultiScanner-plus.exe
+tools/
+engines/
+schemas/
+canary_templates/
+docs/
+README.md
+start-web.ps1
+```
+
+双击：
+
+```text
+OpenClaw-MultiScanner-plus.exe
+```
+
+即可启动本地 Web 控制台并打开：
+
+```text
+http://127.0.0.1:8765/
+```
+
+注意：不要单独移动 exe。该 exe 需要与 `tools/`、`engines/`、`schemas/` 等目录保持在同一工具根目录下。
+
+## 报告输出
+
+工具支持三种报告格式：
+
+- HTML：适合本地查看和比赛展示。
+- JSON：完整机器可读证据对象，适合复核、对比和自动化处理。
+- Markdown：适合归档、审查和文档引用。
+
+Web 控制台稳定优化版采用“一次扫描，多格式渲染”的流程：
+
+```text
+四层扫描 -> JSON 证据对象 -> HTML 报告 / Markdown 报告
+```
+
+这样可以减少重复扫描时间，并保证不同格式报告基于同一份证据。
 
 ## 安全边界
 
-本工具默认只做本地只读扫描、HTTP 轻量探测和 plan-only canary。它不会主动执行危险 payload，不会读取真实敏感文件内容，不会创建持久任务，也不会向第三方目标发送验证流量。任何动态方法级验证都应在授权实验环境中单独开启。
+本工具默认用于本地授权环境下的 OpenClaw 安全审计。默认行为包括本地只读扫描、轻量 HTTP 探测和 plan-only Canary 生成。动态 Probe 和 Canary Lab 需要用户显式开启，并应在授权实验环境中使用。
+
+工具不会主动执行危险 payload，不会创建持久化任务，不会向第三方目标发送验证流量。所有报告和证据默认保存在本地 `reports/` 目录中。
 
 ## 当前状态
 
-当前版本已经实现四层框架、中文 HTML 报告、本地 Web 前端、环境自检、第二层新版 Agent Skill Guard 深度引擎接入、第一/三/四层联动增强、第三层动态授权安全探测和第四层本机 canary 实验模式。下一阶段建议继续补充更多 OpenClaw 内部方法族样本、正式化新版引擎单元测试，以及增加跨层证据链可视化板块。
+当前 v2.0 稳定优化版已经实现：
 
-## 关于 Agent Skill Guard 深度引擎
+- 四层联动扫描架构
+- 新版 Agent Skill Guard v2 深度引擎接入
+- Skill / Agent / MCP / AI BOM 生态风险识别
+- 连接后信任边界与方法授权矩阵
+- 风险驱动 Canary 影响面验证
+- 中文 HTML / JSON / Markdown 报告
+- Web 控制台和历史报告管理
+- 第二层深度引擎独立入口
+- Windows 可执行交付包启动方式
 
-本仓库现在内置新版 `engines/agent-skill-guard` 作为唯一第二层深度引擎。它覆盖 Agent Skill、OpenClaw Skill、MCP 配置、Tool schema 和 prompt package，并输出 AI BOM、MCP schema 审计、隐藏指令、claims-vs-evidence、toxic flow、policy gate 和中文 finding。
-
-ClawMatrix 的第二层由两部分组成：内置轻量能力识别和新版 Agent Skill Guard 深度引擎。新版引擎结果会被归一化为 `risk_context`，继续驱动第三层风险驱动授权矩阵和第四层风险驱动 canary 计划。这样既保持四层扫描器的独立架构，也增强了 Skill / Agent 生态供应链审计能力。
+该工具适合作为 OpenClaw 环境的多阶段信任边界审计、Agent 生态供应链风险分析和比赛展示型安全扫描平台。
